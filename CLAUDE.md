@@ -1,3 +1,7 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
 # TABTSR — DOS-TSR für TAB-Dateinamen-Completion
 
 Resident-Programm (TSR) für **MS-DOS 6.22 auf echtem 386**. Hookt
@@ -8,13 +12,16 @@ eigenen Editor mit TAB-Completion (4DOS-artiges Zykeln durch Treffer).
 
 - Compiler: **Open Watcom 16-bit, Real Mode** — NICHT `wcl386`. Ein TSR
   läuft im Real Mode.
-- Vor dem Kompilieren **muss** `%WATCOM%\setvars.bat` aufgerufen werden
-  (sonst findet `wcl` keine Tools/Headers). `build.bat` erledigt das automatisch.
-- Bauen: `build.bat` (ruft setvars.bat, dann `wcl`). Ausgabe: `tabtsr.exe`.
+- Open Watcom liegt unter `C:\WATCOM`, Binaries in `binnt64\`. `build.bat`
+  ruft `%WATCOM%\owsetenv.bat` auf und setzt den PATH automatisch.
+- Bauen: aus CMD `build.bat` aufrufen (nicht per Doppelklick im Explorer —
+  dann fehlt das Argument). Ausgabe: `tabtsr.exe`.
+- Test in DOSBox: `build.bat test` — startet `C:\dosgames\DOSBox.exe`,
+  mounted das Projektverzeichnis als `C:`, lädt `tabtsr`, wartet mit `pause`.
 - **Compile-Loop ist closed-loop** über Claude Code: Agent baut via
   `build.bat`, liest `wcl`-Fehler, fixt, baut neu.
-- **Laufzeit-/Verhaltenstest ist IMMER manuell**: erst DOSBox-X
-  (`build.bat test`), dann echter 386. Nie ungetestet auf Hardware —
+- **Laufzeit-/Verhaltenstest ist IMMER manuell**: erst DOSBox (`build.bat test`),
+  dann echter 386. Nie ungetestet auf Hardware —
   ein fehlerhafter INT-21h-Hook kann den Rechner hängen lassen.
 
 ## Architektur-Kern (Invarianten, nicht kaputt machen)
