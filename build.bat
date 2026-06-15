@@ -7,7 +7,8 @@ rem ============================================================
 
 rem --- Open Watcom Environment einrichten ---
 if "%WATCOM%"=="" set WATCOM=C:\WATCOM
-call "%WATCOM%\setvars.bat" > nul 2>&1
+call "%WATCOM%\owsetenv.bat" > nul 2>&1
+set PATH=%WATCOM%\binnt64;%PATH%
 
 wcl -bt=dos -ms -os -zq -fe=tabtsr.exe tabtsr.c
 if errorlevel 1 (
