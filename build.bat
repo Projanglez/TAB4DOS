@@ -20,6 +20,6 @@ echo BUILD OK -^> tabtsr.exe
 
 if /i "%1"=="test" (
     echo Starte DOSBox-X, lade TSR...
-    dosbox-x -c "mount c %CD%" -c "c:" -c "tabtsr"
+    "C:\dosgames\DOSBox.exe" -c "mount c %CD%" -c "c:" -c "tabtsr" -c "pause"
 )
 exit /b 0
