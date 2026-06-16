@@ -37,8 +37,14 @@ eigenen Editor mit TAB-Completion (4DOS-artiges Zykeln durch Treffer).
   dem DOS-Handler ab, deshalb dürfen wir selbst DOS-Funktionen (02h,
   4Eh/4Fh, 1Ah/2Fh) aufrufen. Diese Invariante ist die Grundlage von allem.
 - **Resident-Code: keine non-reentrant C-Runtime.** Kein `printf`/`malloc`
-  im Hook. Nur `int86`/`intdos` (Register per Pointer ⇒ reentrant) und
-  direkte INT-Aufrufe.
+  im Hook.
+- **`int86` NICHT im Resident benutzen!** `int86` muss eine *variable*
+  Int-Nummer ausführen (Dispatch/selbstmodifizierend) und versagt im
+  residenten Interrupt-Kontext — die Taste wurde nie konsumiert, Tastatur-
+  Puffer lief über, „Eingabe tot + Beep". War (zusammen mit `__STK`) die
+  Ursache der HW-Hänger. Stattdessen: **direkter `INT` per `#pragma aux`**
+  (feste Opcode-Nummer, z.B. `get_key` mit `int 0x16`). `intdos`/`intdosx`/
+  `segread` sind ok (feste Nummer 21h). Per `wdis` verifiziert.
 - **DTA:** vor `FindFirst` eigene DTA setzen, danach COMMAND.COMs DTA
   restaurieren.
 - **new21:** Funktion 0Ah selbst behandeln (`return` ⇒ IRET, nicht chainen),

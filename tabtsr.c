@@ -88,15 +88,16 @@ static void con_out( char c )
 }
 static void msg( char *s ) { while ( *s ) con_out( *s++ ); }
 
-/* -------- Taste lesen via INT 16h/00h (wir sind Aufrufer, kein Hook) ---- */
-
-static unsigned get_key( void )
-{
-    union REGS r;
-    r.h.ah = 0x00;
-    int86( 0x16, &r, &r );
-    return r.w.ax;                     /* AL=ASCII, AH=Scancode             */
-}
+/* -------- Taste lesen via INT 16h/00h (wir sind Aufrufer, kein Hook) ----
+   DIREKTES INT 16h, NICHT int86: int86 muss eine variable Int-Nummer
+   ausfuehren (Dispatch/selbstmodifizierend) und versagt im residenten
+   Interrupt-Kontext - Taste wurde nicht konsumiert, Puffer lief voll.
+   intdos/intdosx (feste Nummer 21h) sind dagegen ok. */
+unsigned get_key( void );
+#pragma aux get_key =   \
+    "mov ah,0"          \
+    "int 0x16"          \
+    value [ax];         /* AL=ASCII, AH=Scancode */
 
 /* -------- Verzeichnis-Scan: einmal am Eingang von do_readline ----------- */
 
