@@ -47,6 +47,9 @@ unsigned get_sp( void );
 static void (__interrupt __far *old21)();
 static void (__interrupt __far *old16)();
 
+/* InDOS-Flag-Zeiger (INT 21h/34h) — Re-Entranz-Schutz in new21 */
+static unsigned char far *indos_ptr = 0;
+
 /* -------- resident: Dateiname-Cache (von scan_directory gefuellt) ------- */
 
 #define MAX_FILES 64
@@ -124,6 +127,7 @@ static void scan_directory( void )
     file_count = 0;
 
     /* alte DTA sichern */
+    segread( &s );
     r.h.ah = 0x2F;
     intdosx( &r, &r, &s );
     save_dta_seg = s.es; save_dta_off = r.x.bx;
@@ -172,11 +176,19 @@ static int strlen_local( const char *s )
     while ( s[n] ) n++;
     return n;
 }
+/* Case-insensitiver Vergleich: file_cache haelt DTA-Namen GROSS, comp_base
+   die roh getippten (meist kleinen) Tasten. FAT16-Case-Insensitivity gilt nur
+   fuer DOS' eigenen Vergleich — wir matchen hier selbst, also upcasen. */
 static int memcmp_local( const char *a, const char *b, int n )
 {
     int i;
-    for ( i = 0; i < n; i++ )
-        if ( a[i] != b[i] ) return 1;
+    char ca, cb;
+    for ( i = 0; i < n; i++ ) {
+        ca = a[i]; cb = b[i];
+        if ( ca >= 'a' && ca <= 'z' ) ca -= 0x20;
+        if ( cb >= 'a' && cb <= 'z' ) cb -= 0x20;
+        if ( ca != cb ) return 1;
+    }
     return 0;
 }
 
@@ -184,7 +196,7 @@ static int memcmp_local( const char *a, const char *b, int n )
 
 static void do_complete_queue( void )
 {
-    int i, target, count, matched, nl, namelen;
+    int i, target, count, matched, nl, namelen, erase;
 
     target  = comp_index;
     matched = -1;
@@ -201,7 +213,6 @@ static void do_complete_queue( void )
 
     if ( matched < 0 && target > 0 ) {             /* wrap: von vorn        */
         comp_index = 0;
-        count = 0;
         for ( i = 0; i < file_count; i++ ) {
             if ( comp_base_len == 0 ||
                  ( strlen_local(file_cache[i]) >= comp_base_len &&
@@ -214,7 +225,10 @@ static void do_complete_queue( void )
 
     if ( matched < 0 ) { comp_active = 0; return; }   /* kein Treffer       */
 
-    for ( i = 0; i < shown_len; i++ ) q_push( 0x0E08 ); /* Backspace        */
+    /* Erste TAB: getipptes Praefix (comp_base_len) loeschen.
+       Folge-TABs (Zykeln): vorigen Treffer (shown_len) loeschen. */
+    erase = comp_active ? shown_len : comp_base_len;
+    for ( i = 0; i < erase; i++ ) q_push( 0x0E08 );   /* Backspace          */
 
     namelen = strlen_local( file_cache[matched] );
     nl = 0;
@@ -224,7 +238,8 @@ static void do_complete_queue( void )
     }
     if ( file_is_dir[matched] ) { q_push( '\\' ); nl++; }
 
-    shown_len = nl;
+    shown_len   = nl;
+    comp_active = 1;
     comp_index++;
 }
 
@@ -232,51 +247,71 @@ static void do_complete_queue( void )
 
 void __interrupt __far new16( union INTPACK r )
 {
+    unsigned char ah = r.h.ah;
     unsigned key;
 
-    if ( r.h.ah != 0x00 ) { _chain_intr( old16 ); return; }
+    /* AH=00h (Standard) UND AH=10h (Enhanced) sind blockierendes Lesen.
+       Beide muessen wir abfangen: DOS/DOSKEY nutzen auf 386ern mit
+       Enhanced-Keyboard-BIOS oft 10h/11h statt 00h/01h. */
+    if ( ah == 0x00 || ah == 0x10 ) {
+        if ( !Q_EMPTY() ) { r.w.ax = q_pop(); return; }
 
-    if ( !Q_EMPTY() ) {
-        r.x.ax = q_pop();
+        /* eigenes blockierendes Warten: STI, bis BIOS-Puffer eine Taste hat */
+        _enable();
+        while ( bios_peek_head() == bios_peek_tail() ) { /* warten */ }
+        key = bios_take_key();
+
+        if ( (key & 0xFF) == 0x09 && readline_active ) {   /* TAB           */
+            do_complete_queue();
+            if ( !Q_EMPTY() ) { r.w.ax = q_pop(); return; }
+            r.w.ax = key;
+            return;
+        }
+        else if ( (key & 0xFF) == 0x0D ) {                 /* ENTER         */
+            readline_active = 0;
+            comp_active = 0; comp_base_len = 0; shown_len = 0;
+        }
+        else if ( (key & 0xFF) == 0x08 ) {                 /* Backspace     */
+            comp_active = 0;
+            if ( comp_base_len > 0 ) comp_base_len--;
+        }
+        else if ( (key & 0xFF) >= 0x20 && (key & 0xFF) < 0x7F ) { /* Printbl */
+            comp_active = 0;
+            if ( comp_base_len < NAME_LEN - 1 )
+                comp_base[comp_base_len++] = (char)(key & 0xFF);
+        }
+        else {
+            comp_active = 0;                               /* Sondertasten  */
+        }
+
+        r.w.ax = key;
         return;
     }
 
-    /* eigenes blockierendes Warten: STI, bis BIOS-Puffer eine Taste hat */
-    _enable();
-    while ( bios_peek_head() == bios_peek_tail() ) { /* warten */ }
-    key = bios_take_key();
-
-    if ( (key & 0xFF) == 0x09 && readline_active ) {       /* TAB           */
-        do_complete_queue();
-        if ( !Q_EMPTY() ) { r.x.ax = q_pop(); return; }
-        r.x.ax = key;
+    /* AH=01h (Status) UND AH=11h (Enhanced-Status): wenn unsere Queue noch
+       Completion-Zeichen enthaelt, MUESSEN wir "Taste verfuegbar" melden —
+       sonst pollt DOS/DOSKEY den BIOS-Puffer (leer) und holt den Rest des
+       Dateinamens nie ab (halb eingefuegter Name / scheinbarer Haenger). */
+    if ( ah == 0x01 || ah == 0x11 ) {
+        if ( !Q_EMPTY() ) {
+            r.w.ax     = kbd_queue[q_head];   /* Peek, nicht poppen         */
+            r.w.flags &= ~0x0040;             /* ZF=0 -> Taste verfuegbar   */
+            return;
+        }
+        _chain_intr( old16 );                 /* sonst BIOS fragen          */
         return;
     }
-    else if ( (key & 0xFF) == 0x0D ) {                     /* ENTER         */
-        readline_active = 0;
-        comp_active = 0; comp_base_len = 0; shown_len = 0;
-    }
-    else if ( (key & 0xFF) == 0x08 ) {                     /* Backspace     */
-        comp_active = 0;
-        if ( comp_base_len > 0 ) comp_base_len--;
-    }
-    else if ( (key & 0xFF) >= 0x20 && (key & 0xFF) < 0x7F ) { /* Printable  */
-        comp_active = 0;
-        if ( comp_base_len < NAME_LEN - 1 )
-            comp_base[comp_base_len++] = (char)(key & 0xFF);
-    }
-    else {
-        comp_active = 0;                                   /* Sondertasten  */
-    }
 
-    r.x.ax = key;
+    _chain_intr( old16 );                     /* alle anderen Funktionen    */
 }
 
 /* -------- INT 21h Hook: scannt Verzeichnis, reicht Zeileneingabe weiter - */
 
 void __interrupt __far new21( union INTPACK r )
 {
-    if ( r.h.ah == 0x0A ) {
+    /* Nur scannen, wenn DOS NICHT re-entrant ist (InDOS==0). Sonst wuerden
+       unsere DOS-Calls in scan_directory den DOS-Zustand korrumpieren. */
+    if ( r.h.ah == 0x0A && *indos_ptr == 0 ) {
         scan_directory();
         readline_active = 1;
         comp_active = 0; comp_base_len = 0; shown_len = 0; comp_index = 0;
@@ -297,10 +332,17 @@ static void msg( char *s ) { while ( *s ) con_out( *s++ ); }
 
 int main( void )
 {
+    union REGS r; struct SREGS s;
     unsigned para;
 
-    msg( "TABTSR v0.2 - TAB-Dateinamen-Completion fuer DOS\r\n" );
-    msg( "INT 21h/0Ah + INT 16h/00h gehookt, jetzt resident.\r\n" );
+    msg( "TABTSR v0.2.1 - TAB-Dateinamen-Completion fuer DOS\r\n" );
+    msg( "INT 21h/0Ah + INT 16h (00h/10h/01h/11h) gehookt, jetzt resident.\r\n" );
+
+    /* InDOS-Flag-Zeiger holen (ES:BX) fuer Re-Entranz-Schutz in new21 */
+    segread( &s );
+    r.h.ah = 0x34;
+    intdosx( &r, &r, &s );
+    indos_ptr = (unsigned char far *)MK_FP( s.es, r.x.bx );
 
     old21 = _dos_getvect( 0x21 );
     old16 = _dos_getvect( 0x16 );
