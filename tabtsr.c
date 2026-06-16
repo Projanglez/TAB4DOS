@@ -26,6 +26,9 @@
 #include <dos.h>
 #include <i86.h>
 
+#define TABTSR_VERSION "0.3.1"        /* bei jedem Build letzte Stelle +1   */
+#define DEBUG_SCAN     1              /* 1 = file_count oben rechts anzeigen */
+
 extern unsigned _psp;
 
 unsigned get_ss( void );
@@ -90,6 +93,23 @@ void con_out( char c );
     parm [al]           \
     modify [ah bx];
 static void msg( char *s ) { while ( *s ) con_out( *s++ ); }
+
+/* -------- Debug: direkt ins Video-RAM schreiben (kein DOS/BIOS) --------- */
+#if DEBUG_SCAN
+static void poke_ch( int col, char ch )
+{
+    *(unsigned char far *)MK_FP( 0xB800, col*2     ) = (unsigned char)ch;
+    *(unsigned char far *)MK_FP( 0xB800, col*2 + 1 ) = 0x4F;   /* weiss/rot */
+    *(unsigned char far *)MK_FP( 0xB000, col*2     ) = (unsigned char)ch;
+    *(unsigned char far *)MK_FP( 0xB000, col*2 + 1 ) = 0x70;
+}
+static void poke_hex( int col, unsigned char v )
+{
+    static char hx[] = "0123456789ABCDEF";
+    poke_ch( col,   hx[(v >> 4) & 0x0F] );
+    poke_ch( col+1, hx[v & 0x0F] );
+}
+#endif
 
 /* -------- Taste lesen via INT 16h/00h (wir sind Aufrufer, kein Hook) ----
    DIREKTES INT 16h, NICHT int86: int86 muss eine variable Int-Nummer
@@ -258,6 +278,13 @@ static void do_readline( unsigned bseg, unsigned boff )
     scan_directory();                 /* sicher: InDOS==0, flacher Stack    */
     comp_active = 0; comp_base_len = 0; shown_len = 0; comp_index = 0;
 
+#if DEBUG_SCAN
+    /* oben rechts: "FC=NN c" -> NN=file_count(hex), c=1.Zeichen 1.Datei */
+    poke_ch(60,'F'); poke_ch(61,'C'); poke_ch(62,'=');
+    poke_hex(63, (unsigned char)file_count);
+    poke_ch(66, (char)(file_count > 0 ? file_cache[0][0] : '-'));
+#endif
+
     for ( ;; ) {
         k = get_key();
         ascii = (unsigned char)( k & 0xFF );
@@ -310,7 +337,7 @@ int main( void )
     union REGS r; struct SREGS s;
     unsigned para;
 
-    msg( "TABTSR v0.3 - TAB-Dateinamen-Completion fuer DOS\r\n" );
+    msg( "TABTSR v" TABTSR_VERSION " - TAB-Completion fuer DOS\r\n" );
     msg( "Eigener Editor, nur INT 21h/0Ah gehookt. Jetzt resident.\r\n" );
 
     segread( &s );                    /* InDOS-Flag-Zeiger holen (ES:BX)    */
