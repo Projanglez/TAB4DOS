@@ -77,15 +77,18 @@ static int memcmp_local( const char *a, const char *b, int n )
     return 0;
 }
 
-/* -------- Konsolen-Ausgabe via INT 21h/02h ------------------------------ */
-
-static void con_out( char c )
-{
-    union REGS r;
-    r.h.ah = 0x02;
-    r.h.dl = (unsigned char)c;
-    intdos( &r, &r );
-}
+/* -------- Konsolen-Ausgabe via BIOS INT 10h/0Eh (Teletype) --------------
+   NICHT DOS AH=02h: das wuerde unseren eigenen INT-21h-Hook erneut betreten
+   (nested) und ueber _chain_intr laufen - dabei kam bei DOS ein falsches
+   Zeichen an (Echo zeigte 0xDB statt der Taste). BIOS INT 10h umgeht den
+   Hook komplett (wie INT 16h beim Tasten-Lesen). 0x07=BEL piept. */
+void con_out( char c );
+#pragma aux con_out =   \
+    "mov ah,0x0E"       \
+    "mov bx,0x0007"     \
+    "int 0x10"          \
+    parm [al]           \
+    modify [ah bx];
 static void msg( char *s ) { while ( *s ) con_out( *s++ ); }
 
 /* -------- Taste lesen via INT 16h/00h (wir sind Aufrufer, kein Hook) ----
