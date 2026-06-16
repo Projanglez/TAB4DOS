@@ -1,33 +1,22 @@
 /*
  * TABTSR - TAB-Dateinamen-Completion fuer MS-DOS
- * v0.3  -  Open Watcom C (16-bit, Real Mode)
+ * v0.7  -  Open Watcom C (16-bit, Real Mode)
  *
- * Architektur (siehe CLAUDE.md)
- * -----------------------------
- * Eigenstaendiger Zeileneditor. Wir hooken NUR INT 21h / AH=0Ah und
- * uebernehmen die Zeileneingabe komplett selbst (return == IRET, KEIN chain
- * an DOS). Tasten lesen wir als ganz normaler Aufrufer von INT 16h (BIOS
- * blockiert fuer uns) - wir hooken INT 16h NICHT. Damit entfaellt der ganze
- * v0.2-Schmerz (Busy-Wait, volatile, DOSKEY-Bypass).
+ * Architektur: eigenstaendiger Zeileneditor, hooken NUR INT 21h / AH=0Ah.
+ * Tasten via INT 16h (Aufrufer, kein Hook). InDOS==0 beim Eintritt garantiert.
+ * SS != DS im Hook: alle Puffer global (DGROUP). Kein int86/intdos im Resident.
  *
- * Warum das traegt (beides auf echter 386er-HW erprobt):
- *   - Tasten als INT-16h-Aufrufer lesen: v0.1 konnte damit normal tippen.
- *   - scan_directory (FindFirst am AH=0Ah-Eingang, InDOS==0): in v0.2 Test 2
- *     lief der Prompt damit sauber.
- * Neu/sicher: TAB sucht nur im bereits gescannten file_cache - KEIN DOS-Call
- * im heissen Pfad (das war v0.1s Absturzursache).
+ * Features: TAB-Completion (Dateien, Verzeichnisse, Pfade, DOS-Befehle, PATH),
+ * Command-History (Pfeil Hoch/Runter), Ctrl+R Rueckwaertssuche, Mid-Line-Editing
+ * (Pfeil Links/Rechts, Home, End, Del, Ins, Ctrl+Links/Rechts). /u Deinstallation.
  *
- * v0.3 ist append-only (kein Cursor/Mid-Line-Editing), Basename im aktuellen
- * Verzeichnis. History + Editing folgen als naechste Inkremente (DOSKEY-Ersatz).
- *
- * Build: build.bat   Test: ZUERST DOSBox (nur Lade-Check!), dann echter 386.
+ * Build: build.bat   Test: DOSBox (Lade-Check), dann echter 386.
  */
 
 #include <dos.h>
 #include <i86.h>
 
-#define TABTSR_VERSION "0.4.1"        /* bei jedem Build letzte Stelle +1   */
-#define DEBUG_SCAN     0              /* 1 = file_count oben rechts anzeigen */
+#define TABTSR_VERSION "0.7.1"
 
 extern unsigned _psp;
 
@@ -36,78 +25,69 @@ unsigned get_ss( void );
 unsigned get_sp( void );
 #pragma aux get_sp = "mov ax, sp" value [ax];
 
-/* -------- resident: Hook-Pointer + InDOS-Flag --------------------------- */
-
+/* -------- Hook + InDOS -------------------------------------------------- */
 static void (__interrupt __far *old21)();
-static unsigned char far *indos_ptr = 0;   /* INT 21h/34h, Re-Entranz-Schutz */
+static unsigned char far *indos_ptr = 0;
 
-/* -------- resident: Erkennung fuer /u (Deinstallation) ------------------
-   Eine neue Programminstanz (gestartet mit /u) muss die RESIDENTE Kopie im
-   Speicher wiederfinden, OHNE dass beide je miteinander kommunizieren. Trick:
-   Beide Instanzen sind dieselbe .exe, also liegen new21/sig/old21/my_psp_seg
-   bei JEDEM Lauf am GLEICHEN Offset innerhalb von CS bzw. DGROUP (nur die
-   Segment-ADRESSE, an die DOS laedt, ist pro Lauf anders). Daher:
-   1. aktueller INT-21h-Vektor holen, Offset mit Offset von new21 vergleichen
-      (sind wir ueberhaupt noch der oberste Hook?).
-   2. DGROUP-Segment der residenten Instanz = CS_dort + (DS-CS dieser neuen
-      Instanz) - die Differenz ist layout-fix, da gleiches Programm.
-   3. Signatur an bekanntem Offset gegenlesen, um Zufallstreffer auszuschliessen.
-   4. my_psp_seg (auch resident, vom Install gesetzt) liefert direkt das
-      Speicherblock-Segment fuer die Freigabe (AH=49h). */
+/* -------- /u Erkennungs-Signatur ---------------------------------------- */
 static const char sig[] = "TABTSR-RES-1";
-static unsigned my_psp_seg = 0;            /* beim Install: _psp dieser Instanz */
+static unsigned my_psp_seg = 0;
 
-/* -------- resident: Dateiname-Cache (von scan_directory gefuellt) ------- */
-
+/* -------- Dateiname-Cache ----------------------------------------------- */
 #define MAX_FILES 64
-#define NAME_LEN  13                  /* 8.3 + NUL                          */
+#define NAME_LEN  13
 
 static char          file_cache[MAX_FILES][NAME_LEN];
 static unsigned char file_is_dir[MAX_FILES];
 static int           file_count;
 
-/* DTA-Puffer MUSS global sein (DGROUP)! Im Interrupt-Hook ist SS != DS;
-   ein Stack-Array + (void far*)-Cast wuerde DS statt SS nehmen -> DOS
-   schreibt woanders hin als wir lesen (las Stack-Muell). */
+/* DTA MUSS global sein (SS!=DS im Hook) */
 static unsigned char dta_buf[64];
 
-/* -------- resident: Command-History (Ring-Puffer) -----------------------
-   Alle Puffer sind global (DGROUP) - SS!=DS-Invariante des Hooks!          */
+/* -------- Befehlsname-Cache (DOS-Intern + PATH-Executables) ------------- */
+#define CMD_MAX 128
+static char cmd_cache[CMD_MAX][NAME_LEN];
+static int  cmd_count = 0;
 
+/* -------- Completion-Zustand -------------------------------------------- */
+#define COMP_FILE 0
+#define COMP_CMD  1
+static char comp_base[NAME_LEN];
+static int  comp_base_len = 0;
+static int  comp_active   = 0;
+static int  comp_index    = 0;
+static int  shown_len     = 0;
+static int  comp_mode     = COMP_FILE;
+
+/* Pfad-Completion: Verzeichnis-Praefix (global: SS!=DS) */
+static char scan_pat[80];
+static char dir_prefix[68];
+static int  dir_prefix_len = 0;
+
+/* -------- History-Ringpuffer -------------------------------------------- */
 #define HIST_COUNT  20
 #define HIST_MAXLEN 128
-
-static char hist_buf[HIST_COUNT][HIST_MAXLEN]; /* Ring-Puffer               */
-static int  hist_len_arr[HIST_COUNT];          /* tatsaechliche Laenge       */
-static int  hist_head  = 0;   /* naechster Schreib-Index                    */
-static int  hist_total = 0;   /* Anzahl gueltiger Eintraege (0..HIST_COUNT) */
-static int  hist_idx   = -1;  /* -1=Gegenwart; 0=juengster; 1=aelterer ... */
-static char hist_tmp[HIST_MAXLEN]; /* Sicherung aktueller Zeile bei Browsing */
+static char hist_buf[HIST_COUNT][HIST_MAXLEN];
+static int  hist_len_arr[HIST_COUNT];
+static int  hist_head  = 0;
+static int  hist_total = 0;
+static int  hist_idx   = -1;
+static char hist_tmp[HIST_MAXLEN];
 static int  hist_tmp_len = 0;
 
-/* Suchpuffer fuer Ctrl+R (global: kein Stack-Ptr ueber Grenzen)            */
+/* Suchpuffer Ctrl+R */
 static char srch_needle[32];
 static int  srch_needle_len = 0;
-static int  srch_skip = 0;    /* wie viele Treffer soll reverse-search ueberspringen */
+static int  srch_skip       = 0;
+static char srch_save[HIST_MAXLEN];
+static int  srch_save_len   = 0;
 
-/* -------- resident: Completion-Zustand ----------------------------------*/
-
-static char comp_base[NAME_LEN];      /* getippter Stem (Praefix)           */
-static int  comp_base_len = 0;
-static int  comp_active    = 0;       /* 1 = wir zykeln gerade durch Treffer */
-static int  comp_index     = 0;
-static int  shown_len      = 0;       /* aktuell auf dem Schirm: Stem o. Name */
-
-/* -------- kleine lokale String-Helfer (kein <string.h> im Resident) ----- */
-
+/* -------- String-Helfer ------------------------------------------------- */
 static int strlen_local( const char *s )
 {
-    int n = 0;
-    while ( s[n] ) n++;
-    return n;
+    int n = 0; while ( s[n] ) n++; return n;
 }
-/* case-insensitiv: file_cache ist GROSS (DTA), comp_base meist klein.
-   FAT16-Case-Insensitivity gilt nur fuer DOS' eigenen Vergleich. */
+
 static int memcmp_local( const char *a, const char *b, int n )
 {
     int i; char ca, cb;
@@ -120,7 +100,7 @@ static int memcmp_local( const char *a, const char *b, int n )
     return 0;
 }
 
-/* Case-insensitive Substring-Suche: 1=gefunden, 0=nicht */
+/* case-insensitive Substring-Suche; 1=gefunden */
 static int strstr_local( const char *hay, const char *needle, int nlen )
 {
     int hi, ni; char ch, cn;
@@ -128,20 +108,17 @@ static int strstr_local( const char *hay, const char *needle, int nlen )
     for ( hi = 0; hay[hi]; hi++ ) {
         for ( ni = 0; ni < nlen; ni++ ) {
             ch = hay[hi+ni]; cn = needle[ni];
+            if ( !ch ) break;
             if ( ch >= 'a' && ch <= 'z' ) ch -= 0x20;
             if ( cn >= 'a' && cn <= 'z' ) cn -= 0x20;
-            if ( ch != cn || ch == 0 ) break;
+            if ( ch != cn ) break;
         }
         if ( ni == nlen ) return 1;
     }
     return 0;
 }
 
-/* -------- Konsolen-Ausgabe via BIOS INT 10h/0Eh (Teletype) --------------
-   NICHT DOS AH=02h: das wuerde unseren eigenen INT-21h-Hook erneut betreten
-   (nested) und ueber _chain_intr laufen - dabei kam bei DOS ein falsches
-   Zeichen an (Echo zeigte 0xDB statt der Taste). BIOS INT 10h umgeht den
-   Hook komplett (wie INT 16h beim Tasten-Lesen). 0x07=BEL piept. */
+/* -------- Konsolen-Ausgabe via BIOS INT 10h/0Eh ------------------------- */
 void con_out( char c );
 #pragma aux con_out =   \
     "mov ah,0x0E"       \
@@ -149,42 +126,15 @@ void con_out( char c );
     "int 0x10"          \
     parm [al]           \
     modify [ah bx];
+
 static void msg( char *s ) { while ( *s ) con_out( *s++ ); }
 
-/* -------- Debug: direkt ins Video-RAM schreiben (kein DOS/BIOS) --------- */
-#if DEBUG_SCAN
-static void poke_ch( int col, char ch )
-{
-    *(unsigned char far *)MK_FP( 0xB800, col*2     ) = (unsigned char)ch;
-    *(unsigned char far *)MK_FP( 0xB800, col*2 + 1 ) = 0x4F;   /* weiss/rot */
-    *(unsigned char far *)MK_FP( 0xB000, col*2     ) = (unsigned char)ch;
-    *(unsigned char far *)MK_FP( 0xB000, col*2 + 1 ) = 0x70;
-}
-static void poke_hex( int col, unsigned char v )
-{
-    static char hx[] = "0123456789ABCDEF";
-    poke_ch( col,   hx[(v >> 4) & 0x0F] );
-    poke_ch( col+1, hx[v & 0x0F] );
-}
-#endif
-
-/* -------- Taste lesen via INT 16h/00h (wir sind Aufrufer, kein Hook) ----
-   DIREKTES INT 16h, NICHT int86: int86 muss eine variable Int-Nummer
-   ausfuehren (Dispatch/selbstmodifizierend) und versagt im residenten
-   Interrupt-Kontext - Taste wurde nicht konsumiert, Puffer lief voll.
-   intdos/intdosx (feste Nummer 21h) sind dagegen ok. */
+/* -------- Taste lesen via INT 16h/00h (direkter Opcode, kein int86) ----- */
 unsigned get_key( void );
-#pragma aux get_key =   \
-    "mov ah,0"          \
-    "int 0x16"          \
-    value [ax];         /* AL=ASCII, AH=Scancode */
+#pragma aux get_key = "mov ah,0" "int 0x16" value [ax];
 
-/* -------- Direkte INT-21h-Helfer (feste Opcodes, NICHT intdos/intdosx) ---
-   intdos/intdosx versagen wie int86 im residenten Kontext (Int-Dispatch-
-   Wrapper). Hier per #pragma aux mit literalem "int 0x21". DOS-Carry kommt
-   ueber sbb ax,ax (CF -> 0/0xFFFF) zurueck. Far-Pointer in DX:AX. */
-
-void far *dos_get_dta( void );              /* AH=2Fh -> DTA (ES:BX)        */
+/* -------- Direkte INT-21h-Helfer ---------------------------------------- */
+void far *dos_get_dta( void );
 #pragma aux dos_get_dta =   \
     "mov ah,0x2F"           \
     "int 0x21"              \
@@ -193,7 +143,7 @@ void far *dos_get_dta( void );              /* AH=2Fh -> DTA (ES:BX)        */
     value  [dx ax]          \
     modify [bx cx si di es];
 
-void dos_set_dta( void far *p );            /* AH=1Ah, DS:DX = p            */
+void dos_set_dta( void far *p );
 #pragma aux dos_set_dta =   \
     "push ds"               \
     "mov ds,dx"             \
@@ -204,7 +154,7 @@ void dos_set_dta( void far *p );            /* AH=1Ah, DS:DX = p            */
     parm   [dx ax]          \
     modify [ax bx cx si di es];
 
-unsigned dos_findfirst( void far *pat, unsigned attr );  /* AH=4Eh, 0=ok    */
+unsigned dos_findfirst( void far *pat, unsigned attr );
 #pragma aux dos_findfirst = \
     "push ds"               \
     "mov ds,dx"             \
@@ -217,7 +167,7 @@ unsigned dos_findfirst( void far *pat, unsigned attr );  /* AH=4Eh, 0=ok    */
     value  [ax]             \
     modify [bx cx dx si di es];
 
-unsigned dos_findnext( void );              /* AH=4Fh, 0=ok                 */
+unsigned dos_findnext( void );
 #pragma aux dos_findnext =  \
     "mov ah,0x4F"           \
     "int 0x21"              \
@@ -225,20 +175,17 @@ unsigned dos_findnext( void );              /* AH=4Fh, 0=ok                 */
     value  [ax]             \
     modify [bx cx dx si di es];
 
-/* -------- Verzeichnis-Scan: einmal am Eingang von do_readline ----------- */
-
-static void scan_directory( void )
+/* -------- Verzeichnis-Scan ---------------------------------------------- */
+static void scan_directory_path( void far *pat )
 {
     void far *save_dta;
     unsigned ok;
-
     file_count = 0;
     save_dta = dos_get_dta();
-    dos_set_dta( (void far *)dta_buf );          /* global -> DS=DGROUP ok  */
-
-    ok = dos_findfirst( (void far *)"*.*", 0x10 );   /* inkl. Verzeichnisse */
+    dos_set_dta( (void far *)dta_buf );
+    ok = dos_findfirst( pat, 0x10 );
     while ( ok == 0 && file_count < MAX_FILES ) {
-        if ( dta_buf[30] != '.' ) {                  /* "." / ".." weglassen */
+        if ( dta_buf[30] != '.' ) {
             int i;
             for ( i = 0; i < NAME_LEN - 1 && dta_buf[30+i]; i++ )
                 file_cache[file_count][i] = dta_buf[30+i];
@@ -248,105 +195,34 @@ static void scan_directory( void )
         }
         ok = dos_findnext();
     }
-
     dos_set_dta( save_dta );
 }
 
-/* -------- TAB-Completion: sucht im Cache, schreibt direkt in Puffer+Schirm */
-
-/* len per WERT rein und raus! NICHT als Pointer: &len waere ein near-Pointer
-   auf eine Stack-Variable, der ueber DS dereferenziert wird - im Hook ist aber
-   SS != DS, also laese do_complete Muell (war L=0xCC statt 2). */
-static int do_complete( unsigned bseg, unsigned boff, int len )
+static void scan_directory( void )
 {
-    char far *buf = (char far *)MK_FP( bseg, boff );
-    int maxlen = (unsigned char)buf[0];
-    int stem_start, i, target, count, matched, namelen, addlen, avail;
-
-    /* Bei frischer Completion (nicht am Zykeln): Stem = letztes Token
-       (zurueck bis Space oder Backslash) aus dem aktuellen Puffer ziehen. */
-    if ( !comp_active ) {
-        stem_start = len;
-        while ( stem_start > 0 &&
-                buf[2+stem_start-1] != ' ' && buf[2+stem_start-1] != '\\' )
-            stem_start--;
-        comp_base_len = len - stem_start;
-        if ( comp_base_len > NAME_LEN - 1 ) comp_base_len = NAME_LEN - 1;
-        for ( i = 0; i < comp_base_len; i++ )
-            comp_base[i] = buf[2+stem_start+i];
-        comp_index = 0;
-        shown_len  = comp_base_len;   /* der getippte Stem ist gerade sichtbar */
-    }
-
-#if DEBUG_SCAN
-    /* Zeile 2: "BL=NN xy L=MM" -> comp_base_len, comp_base[0..1], len */
-    poke_ch(140,'B'); poke_ch(141,'L'); poke_ch(142,'=');
-    poke_hex(143,(unsigned char)comp_base_len);
-    poke_ch(146, (char)(comp_base_len > 0 ? comp_base[0] : '-'));
-    poke_ch(147, (char)(comp_base_len > 1 ? comp_base[1] : '-'));
-    poke_ch(149,'L'); poke_ch(150,'=');
-    poke_hex(151,(unsigned char)len);
-#endif
-
-    /* Treffer Nr. comp_index suchen (Praefix comp_base, case-insensitiv) */
-    target = comp_index; matched = -1; count = 0;
-    for ( i = 0; i < file_count; i++ ) {
-        if ( comp_base_len == 0 ||
-             ( strlen_local(file_cache[i]) >= comp_base_len &&
-               memcmp_local(file_cache[i], comp_base, comp_base_len) == 0 ) ) {
-            if ( count == target ) { matched = i; break; }
-            count++;
-        }
-    }
-    if ( matched < 0 && target > 0 ) {            /* ueber Ende: wrap        */
-        comp_index = 0;
-        for ( i = 0; i < file_count; i++ ) {
-            if ( comp_base_len == 0 ||
-                 ( strlen_local(file_cache[i]) >= comp_base_len &&
-                   memcmp_local(file_cache[i], comp_base, comp_base_len) == 0 ) ) {
-                matched = i; break;
-            }
-        }
-    }
-    if ( matched < 0 ) { con_out( 0x07 ); comp_active = 0; return len; } /* Beep */
-
-    namelen = strlen_local( file_cache[matched] );
-    addlen  = namelen + ( file_is_dir[matched] ? 1 : 0 );
-
-    /* Passt der Treffer (nach Loeschen des sichtbaren Teils) in den Puffer? */
-    avail = (maxlen - 1) - (len - shown_len);
-    if ( addlen > avail ) { con_out( 0x07 ); comp_active = 0; return len; }
-
-    for ( i = 0; i < shown_len; i++ )             /* sichtbaren Teil loeschen */
-        { con_out(0x08); con_out(' '); con_out(0x08); }
-    len -= shown_len;
-
-    for ( i = 0; i < namelen; i++ ) {             /* Treffer schreiben       */
-        buf[2+len] = file_cache[matched][i];
-        con_out( file_cache[matched][i] );
-        len++;
-    }
-    if ( file_is_dir[matched] ) { buf[2+len] = '\\'; con_out('\\'); len++; }
-
-    shown_len   = addlen;
-    comp_active = 1;
-    comp_index++;
-    return len;
+    scan_directory_path( (void far *)"*.*" );
 }
 
 /* -------- History-Hilfsfunktionen --------------------------------------- */
 
-/* Aktuelle Zeile in History speichern (wenn sinnvoll) */
-static void hist_save( char far *data, int len )
+/* Zeile aus COMMAND.COMs Puffer (bseg:boff+2, len Zeichen) in History speichern */
+static void hist_save( unsigned bseg, unsigned boff, int len )
 {
+    char far *data = (char far *)MK_FP( bseg, boff + 2 );
     int i, prev;
     if ( len == 0 ) return;
-    /* Duplikat zum letzten Eintrag? */
     if ( hist_total > 0 ) {
         prev = (hist_head - 1 + HIST_COUNT) % HIST_COUNT;
-        if ( hist_len_arr[prev] == len &&
-             memcmp_local( hist_buf[prev], (const char *)data, len ) == 0 )
-            return;
+        if ( hist_len_arr[prev] == len ) {
+            int match = 1;
+            for ( i = 0; i < len; i++ ) {
+                char ca = hist_buf[prev][i], cb = data[i];
+                if ( ca >= 'a' && ca <= 'z' ) ca -= 0x20;
+                if ( cb >= 'a' && cb <= 'z' ) cb -= 0x20;
+                if ( ca != cb ) { match = 0; break; }
+            }
+            if ( match ) return;
+        }
     }
     for ( i = 0; i < len && i < HIST_MAXLEN - 1; i++ )
         hist_buf[hist_head][i] = data[i];
@@ -356,9 +232,8 @@ static void hist_save( char far *data, int len )
     if ( hist_total < HIST_COUNT ) hist_total++;
 }
 
-/* Zeile auf Bildschirm und in Puffer ersetzen; gibt neue Laenge zurueck.
-   Loescht 'old_len' Zeichen (BS+space+BS), schreibt dann 'new_data[0..new_len]'.
-   new_data liegt IMMER in DGROUP (hist_buf / hist_tmp) - kein Stack-Ptr. */
+/* Aktuelle Zeile loeschen und neue aus DGROUP-Puffer schreiben.
+   Cursor muss VOR dem Aufruf am Zeilenende stehen (old_len Zeichen nach Prompt). */
 static int line_replace( char far *buf, int old_len,
                           const char *new_data, int new_len )
 {
@@ -374,108 +249,228 @@ static int line_replace( char far *buf, int old_len,
     return new_len;
 }
 
-/* -------- Ctrl+R: Rueckwaertssuche in History (reverse-i-search) --------
-   Laeuft als eigene Tastaturschleife. Gibt abschliessende Zeilenlaenge
-   zurueck; -1 = ESC/abgebrochen (Original wiederherstellen). bseg/boff
-   zeigen auf COMMAND.COMs Eingabepuffer. Needle/skip liegen in globalen
-   srch_*-Variablen (kein Stack-Ptr). */
-static int do_search( unsigned bseg, unsigned boff, int old_len )
+/* -------- Cursor N Stellen nach links ----------------------------------- */
+static void cursor_left_n( int n )
 {
-    char far *buf = (char far *)MK_FP( bseg, boff );
-    unsigned k; unsigned char ascii;
-    int i, steps, matched_entry, matched_len, disp_len;
+    while ( n-- > 0 ) con_out( 0x08 );
+}
 
-    /* Zustand zuruecksetzen, alte Zeile loeschen */
+/* -------- Ctrl+R: Rueckwaertssuche in History --------------------------- */
+static int do_search( char far *buf, int old_len )
+{
+    unsigned k; unsigned char ascii;
+    int i, steps, midx, mlen, disp;
+
     srch_needle_len = 0; srch_skip = 0;
+
+    /* Zeile loeschen, Prompt ausgeben */
     for ( i = 0; i < old_len; i++ )
         { con_out(0x08); con_out(' '); con_out(0x08); }
-
     msg( "(search): " );
-    disp_len = 0;   /* Zeichen, die wir nach "(search): " ausgegeben haben */
+    disp = 0;
 
     for ( ;; ) {
-        /* Altes Display loeschen */
-        for ( i = 0; i < disp_len; i++ )
+        /* Vorherige Anzeige loeschen */
+        for ( i = 0; i < disp; i++ )
             { con_out(0x08); con_out(' '); con_out(0x08); }
-        disp_len = 0;
+        disp = 0;
 
-        /* Treffer in History suchen (vom juengsten an) */
-        matched_entry = -1; matched_len = 0;
-        steps = 0;
+        /* Treffer suchen */
+        midx = -1; mlen = 0; steps = 0;
         for ( i = 0; i < hist_total; i++ ) {
             int idx = (hist_head - 1 - i + HIST_COUNT * 2) % HIST_COUNT;
             if ( strstr_local( hist_buf[idx], srch_needle, srch_needle_len ) ) {
                 if ( steps == srch_skip ) {
-                    matched_entry = idx;
-                    matched_len   = hist_len_arr[idx];
-                    break;
+                    midx = idx; mlen = hist_len_arr[idx]; break;
                 }
                 steps++;
             }
         }
 
-        /* Neue Anzeige: Needle + ": " + Treffer (oder Meldung) */
-        for ( i = 0; i < srch_needle_len; i++ ) {
-            con_out( srch_needle[i] ); disp_len++;
-        }
-        if ( matched_entry >= 0 ) {
-            con_out(':'); con_out(' '); disp_len += 2;
-            for ( i = 0; i < matched_len; i++ ) {
-                con_out( hist_buf[matched_entry][i] ); disp_len++;
-            }
+        /* Anzeige: Needle + ": " + Treffer */
+        for ( i = 0; i < srch_needle_len; i++ )
+            { con_out( srch_needle[i] ); disp++; }
+        if ( midx >= 0 ) {
+            con_out(':'); con_out(' '); disp += 2;
+            for ( i = 0; i < mlen; i++ )
+                { con_out( hist_buf[midx][i] ); disp++; }
         } else {
-            msg( ": (kein Treffer)" ); disp_len += 16;
+            msg( ": (kein Treffer)" ); disp += 16;
         }
 
         k = get_key();
         ascii = (unsigned char)( k & 0xFF );
 
         if ( ascii == 0x0D ) {                    /* ENTER: Treffer uebernehmen */
-            /* Alles loeschen (Needle + : + Treffer) */
-            for ( i = 0; i < disp_len; i++ )
+            for ( i = 0; i < disp; i++ )
                 { con_out(0x08); con_out(' '); con_out(0x08); }
-            /* "(search): " loeschen */
             for ( i = 0; i < 10; i++ )
                 { con_out(0x08); con_out(' '); con_out(0x08); }
-            if ( matched_entry >= 0 ) {
-                return line_replace( buf, 0,
-                    hist_buf[matched_entry], matched_len );
-            }
+            if ( midx >= 0 )
+                return line_replace( buf, 0, hist_buf[midx], mlen );
             return 0;
         }
-        else if ( ascii == 0x1B ) {               /* ESC: abbrechen            */
-            for ( i = 0; i < disp_len; i++ )
+        else if ( ascii == 0x1B ) {               /* ESC: abbrechen             */
+            for ( i = 0; i < disp; i++ )
                 { con_out(0x08); con_out(' '); con_out(0x08); }
             for ( i = 0; i < 10; i++ )
                 { con_out(0x08); con_out(' '); con_out(0x08); }
             return -1;
         }
-        else if ( ascii == 0x08 ) {               /* Backspace: Needle kuerzen  */
+        else if ( ascii == 0x08 ) {
             if ( srch_needle_len > 0 ) srch_needle_len--;
             srch_skip = 0;
         }
         else if ( ascii == 0x12 ) {               /* Ctrl+R: naechst-aelterer   */
-            if ( matched_entry >= 0 ) srch_skip++;
+            if ( midx >= 0 ) srch_skip++;
         }
-        else if ( ascii >= 0x20 && ascii < 0x7F ) { /* Zeichen zur Needle hinzu */
+        else if ( ascii >= 0x20 && ascii < 0x7F ) {
             if ( srch_needle_len < (int)(sizeof srch_needle) - 1 ) {
                 srch_needle[srch_needle_len++] = ascii;
                 srch_needle[srch_needle_len]   = 0;
             }
             srch_skip = 0;
         }
-        /* Sonstige Steuerzeichen ignorieren */
     }
 }
 
-/* -------- eigener Zeilen-Editor (haengt im AH=0Ah-Hook) ----------------- */
+/* -------- TAB-Completion ------------------------------------------------ */
+static int do_complete( unsigned bseg, unsigned boff, int len )
+{
+    char far *buf = (char far *)MK_FP( bseg, boff );
+    int maxlen = (unsigned char)buf[0];
+    int i, target, count, matched, namelen, addlen, avail;
 
+    if ( !comp_active ) {
+        int arg_start, slash_pos, j;
+        int first_word;
+
+        /* arg_start: letztes Space vor len */
+        arg_start = len;
+        while ( arg_start > 0 && buf[2+arg_start-1] != ' ' ) arg_start--;
+        first_word = ( arg_start == 0 );
+
+        /* slash_pos: letzter \ oder / im Argument */
+        slash_pos = arg_start;
+        for ( j = arg_start; j < len; j++ )
+            if ( buf[2+j] == '\\' || buf[2+j] == '/' ) slash_pos = j + 1;
+
+        /* dir_prefix */
+        dir_prefix_len = slash_pos - arg_start;
+        if ( dir_prefix_len >= (int)(sizeof dir_prefix) - 1 )
+            dir_prefix_len = (int)(sizeof dir_prefix) - 2;
+        for ( j = 0; j < dir_prefix_len; j++ )
+            dir_prefix[j] = buf[2+arg_start+j];
+        dir_prefix[dir_prefix_len] = 0;
+
+        /* comp_base */
+        comp_base_len = len - slash_pos;
+        if ( comp_base_len > NAME_LEN - 1 ) comp_base_len = NAME_LEN - 1;
+        for ( j = 0; j < comp_base_len; j++ )
+            comp_base[j] = buf[2+slash_pos+j];
+
+        /* Pfad-Scan wenn noetig */
+        if ( !first_word && dir_prefix_len > 0 ) {
+            for ( j = 0; j < dir_prefix_len; j++ ) scan_pat[j] = dir_prefix[j];
+            scan_pat[dir_prefix_len  ] = '*';
+            scan_pat[dir_prefix_len+1] = '.';
+            scan_pat[dir_prefix_len+2] = '*';
+            scan_pat[dir_prefix_len+3] = 0;
+            scan_directory_path( (void far *)scan_pat );
+        }
+
+        comp_mode  = first_word ? COMP_CMD : COMP_FILE;
+        comp_index = 0;
+        shown_len  = dir_prefix_len + comp_base_len;
+    }
+
+    /* Treffer suchen */
+    target = comp_index; matched = -1; count = 0;
+    {
+        int csz = (comp_mode == COMP_CMD) ? cmd_count : file_count;
+        for ( i = 0; i < csz; i++ ) {
+            const char *e = (comp_mode == COMP_CMD) ? cmd_cache[i] : file_cache[i];
+            if ( comp_base_len == 0 ||
+                 ( strlen_local(e) >= comp_base_len &&
+                   memcmp_local(e, comp_base, comp_base_len) == 0 ) ) {
+                if ( count == target ) { matched = i; break; }
+                count++;
+            }
+        }
+        if ( matched < 0 && target > 0 ) {
+            comp_index = 0;
+            for ( i = 0; i < csz; i++ ) {
+                const char *e = (comp_mode == COMP_CMD) ? cmd_cache[i] : file_cache[i];
+                if ( comp_base_len == 0 ||
+                     ( strlen_local(e) >= comp_base_len &&
+                       memcmp_local(e, comp_base, comp_base_len) == 0 ) ) {
+                    matched = i; break;
+                }
+            }
+        }
+    }
+    if ( matched < 0 ) { con_out(0x07); comp_active = 0; return len; }
+
+    {
+        const char *e = (comp_mode == COMP_CMD) ? cmd_cache[matched] : file_cache[matched];
+        namelen = strlen_local( e );
+    }
+
+    if ( comp_mode == COMP_CMD ) {
+        addlen = namelen + 1;                     /* + Leerzeichen           */
+    } else {
+        addlen = namelen + (file_is_dir[matched] ? 1 : 0);
+    }
+
+    avail = (maxlen - 1) - (len - shown_len);
+    if ( dir_prefix_len + addlen > avail ) {
+        con_out(0x07); comp_active = 0; return len;
+    }
+
+    /* Sichtbaren Teil loeschen */
+    for ( i = 0; i < shown_len; i++ )
+        { con_out(0x08); con_out(' '); con_out(0x08); }
+    len -= shown_len;
+
+    /* dir_prefix */
+    for ( i = 0; i < dir_prefix_len; i++ )
+        { buf[2+len] = dir_prefix[i]; con_out(dir_prefix[i]); len++; }
+
+    /* Treffer */
+    {
+        const char *e = (comp_mode == COMP_CMD) ? cmd_cache[matched] : file_cache[matched];
+        for ( i = 0; i < namelen; i++ )
+            { buf[2+len] = e[i]; con_out(e[i]); len++; }
+    }
+
+    if ( comp_mode == COMP_CMD ) {
+        buf[2+len] = ' '; con_out(' '); len++;
+        shown_len  = dir_prefix_len + addlen;
+        comp_active = 1;
+        comp_index++;
+    } else if ( file_is_dir[matched] ) {
+        buf[2+len] = '\\'; con_out('\\'); len++;
+        shown_len   = dir_prefix_len + addlen;
+        comp_active = 0;                          /* naechstes TAB: Unterverzeichnis */
+    } else {
+        shown_len   = dir_prefix_len + addlen;
+        comp_active = 1;
+        comp_index++;
+    }
+
+    return len;
+}
+
+/* -------- Zeilen-Editor ------------------------------------------------- */
 static void do_readline( unsigned bseg, unsigned boff )
 {
     char far *buf = (char far *)MK_FP( bseg, boff );
     int maxlen = (unsigned char)buf[0];
     int len = 0;
+    int cur = 0;                                  /* Cursor-Position 0..len  */
+    int ins = 1;                                  /* 1=Einfuegen, 0=Ueberschr */
     unsigned k; unsigned char ascii, scan;
+    int i;
 
     scan_directory();
     comp_active = 0; comp_base_len = 0; shown_len = 0; comp_index = 0;
@@ -487,70 +482,151 @@ static void do_readline( unsigned bseg, unsigned boff )
         scan  = (unsigned char)( k >> 8 );
 
         if ( ascii == 0x0D ) {                    /* ENTER                  */
-            hist_save( buf + 2, len );
+            /* Cursor ans Ende */
+            while ( cur < len ) { con_out( buf[2+cur] ); cur++; }
+            hist_save( bseg, boff, len );
             hist_idx = -1;
             buf[1] = (char)len;
             buf[2+len] = 0x0D;
             con_out(0x0D); con_out(0x0A);
             return;
         }
+
+        else if ( ascii == 0x09 ) {               /* TAB: nur am Zeilenende */
+            if ( cur < len ) { con_out(0x07); }
+            else {
+                len = do_complete( bseg, boff, len );
+                cur = len;
+            }
+        }
+
         else if ( ascii == 0x08 ) {               /* Backspace              */
-            if ( len > 0 ) {
+            if ( cur > 0 ) {
+                cur--;
+                con_out(0x08);
+                for ( i = cur; i < len - 1; i++ ) buf[2+i] = buf[2+i+1];
                 len--;
-                con_out(0x08); con_out(' '); con_out(0x08);
+                for ( i = cur; i < len; i++ ) con_out( buf[2+i] );
+                con_out(' ');
+                cursor_left_n( len - cur + 1 );
             }
             comp_active = 0; hist_idx = -1;
         }
-        else if ( ascii == 0x09 ) {               /* TAB                    */
-            len = do_complete( bseg, boff, len );
+
+        else if ( ascii == 0x12 ) {               /* Ctrl+R                 */
+            /* Cursor ans Ende, dann Suche */
+            while ( cur < len ) { con_out( buf[2+cur] ); cur++; }
+            /* aktuelle Zeile sichern fuer ESC */
+            for ( i = 0; i < len && i < HIST_MAXLEN-1; i++ )
+                srch_save[i] = buf[2+i];
+            srch_save_len = len;
+            len = do_search( buf, len );
+            if ( len < 0 )
+                len = line_replace( buf, 0, srch_save, srch_save_len );
+            cur = len;
+            comp_active = 0; hist_idx = -1;
         }
-        else if ( ascii == 0x12 ) {               /* Ctrl+R: reverse-search */
-            comp_active = 0;
-            len = do_search( bseg, boff, len );
-            if ( len < 0 ) {                      /* ESC: Original zurueck  */
-                len = line_replace( buf, 0, hist_tmp, hist_tmp_len );
-            }
-            hist_idx = -1;
-        }
+
         else if ( ascii == 0x00 ) {               /* Extended Key           */
             comp_active = 0;
-            if ( scan == 0x48 ) {                 /* Pfeil Hoch             */
+
+            if ( scan == 0x48 ) {                 /* Pfeil Hoch: History    */
                 if ( hist_total == 0 ) { con_out(0x07); continue; }
+                /* Cursor ans Ende */
+                while ( cur < len ) { con_out( buf[2+cur] ); cur++; }
                 if ( hist_idx == -1 ) {
-                    int i;                        /* aktuelle Zeile sichern */
                     for ( i = 0; i < len && i < HIST_MAXLEN-1; i++ )
                         hist_tmp[i] = buf[2+i];
                     hist_tmp_len = len;
                     hist_idx = 0;
                 } else if ( hist_idx < hist_total - 1 ) {
                     hist_idx++;
-                } else {
-                    con_out(0x07); continue;      /* aeltester: Beep        */
-                }
+                } else { con_out(0x07); continue; }
                 {
                     int entry = (hist_head - 1 - hist_idx + HIST_COUNT*2) % HIST_COUNT;
-                    len = line_replace( buf, len,
-                                        hist_buf[entry], hist_len_arr[entry] );
+                    len = line_replace( buf, len, hist_buf[entry], hist_len_arr[entry] );
+                    cur = len;
                 }
             }
-            else if ( scan == 0x50 ) {            /* Pfeil Runter           */
+
+            else if ( scan == 0x50 ) {            /* Pfeil Runter: History  */
                 if ( hist_idx < 0 ) { con_out(0x07); continue; }
+                while ( cur < len ) { con_out( buf[2+cur] ); cur++; }
                 hist_idx--;
                 if ( hist_idx < 0 ) {
                     len = line_replace( buf, len, hist_tmp, hist_tmp_len );
                 } else {
                     int entry = (hist_head - 1 - hist_idx + HIST_COUNT*2) % HIST_COUNT;
-                    len = line_replace( buf, len,
-                                        hist_buf[entry], hist_len_arr[entry] );
+                    len = line_replace( buf, len, hist_buf[entry], hist_len_arr[entry] );
                 }
+                cur = len; hist_idx = hist_idx; /* bleibt */
+            }
+
+            else if ( scan == 0x4B ) {            /* Pfeil Links            */
+                if ( cur > 0 ) { cur--; con_out(0x08); }
+            }
+
+            else if ( scan == 0x4D ) {            /* Pfeil Rechts           */
+                if ( cur < len ) { con_out( buf[2+cur] ); cur++; }
+            }
+
+            else if ( scan == 0x47 ) {            /* Home                   */
+                cursor_left_n( cur ); cur = 0;
+            }
+
+            else if ( scan == 0x4F ) {            /* End                    */
+                while ( cur < len ) { con_out( buf[2+cur] ); cur++; }
+            }
+
+            else if ( scan == 0x53 ) {            /* Del                    */
+                if ( cur < len ) {
+                    for ( i = cur; i < len - 1; i++ ) buf[2+i] = buf[2+i+1];
+                    len--;
+                    for ( i = cur; i < len; i++ ) con_out( buf[2+i] );
+                    con_out(' ');
+                    cursor_left_n( len - cur + 1 );
+                }
+            }
+
+            else if ( scan == 0x52 ) {            /* Ins: Modus wechseln    */
+                ins ^= 1;
+            }
+
+            else if ( scan == 0x73 ) {            /* Ctrl+Links: Wortsprung */
+                int steps = 0;
+                while ( cur > 0 && buf[2+cur-1] == ' ' ) { cur--; steps++; }
+                while ( cur > 0 && buf[2+cur-1] != ' ' ) { cur--; steps++; }
+                cursor_left_n( steps );
+            }
+
+            else if ( scan == 0x74 ) {            /* Ctrl+Rechts: Wortsprung */
+                while ( cur < len && buf[2+cur] != ' ' )
+                    { con_out( buf[2+cur] ); cur++; }
+                while ( cur < len && buf[2+cur] == ' ' )
+                    { con_out( buf[2+cur] ); cur++; }
             }
             /* Alle anderen Extended-Tasten: ignorieren */
         }
-        else if ( ascii >= 0x20 && ascii < 0x7F ) { /* druckbar             */
-            if ( len < maxlen - 1 ) {
-                buf[2+len] = ascii;
-                con_out( ascii );
-                len++;
+
+        else if ( ascii >= 0x20 && ascii < 0x7F ) { /* Druckbar             */
+            if ( cur == len ) {
+                /* Anhaengen */
+                if ( len < maxlen - 1 ) {
+                    buf[2+len] = ascii; con_out(ascii); len++; cur++;
+                }
+            } else if ( ins ) {
+                /* Einfuegen mid-line */
+                if ( len < maxlen - 1 ) {
+                    for ( i = len; i > cur; i-- ) buf[2+i] = buf[2+i-1];
+                    buf[2+cur] = ascii; len++;
+                    con_out(ascii); cur++;
+                    for ( i = cur; i < len; i++ ) con_out( buf[2+i] );
+                    cursor_left_n( len - cur );
+                }
+            } else {
+                /* Ueberschreiben */
+                buf[2+cur] = ascii; con_out(ascii); cur++;
+                if ( cur > len ) len = cur;
             }
             comp_active = 0; hist_idx = -1;
         }
@@ -558,21 +634,17 @@ static void do_readline( unsigned bseg, unsigned boff )
     }
 }
 
-/* -------- INT 21h Hook: AH=0Ah selbst behandeln, sonst chainen ---------- */
-
+/* -------- INT 21h Hook -------------------------------------------------- */
 void __interrupt __far new21( union INTPACK r )
 {
     if ( r.h.ah == 0x0A && *indos_ptr == 0 ) {
         do_readline( r.w.ds, r.w.dx );
-        return;                       /* IRET - wir haben 0Ah erledigt      */
+        return;
     }
     _chain_intr( old21 );
 }
 
-/* -------- Deinstallation (/u) --------------------------------------------
-   Laeuft NICHT resident - ganz normaler Programmstart, daher sind intdosx/
-   int86/printf hier alle unproblematisch (die Resident-Regeln gelten nur fuer
-   den Hook). Siehe Kommentar bei "sig"/"my_psp_seg" oben fuer den Trick. */
+/* -------- Deinstallation (/u) ------------------------------------------- */
 static int do_uninstall( void )
 {
     void far *cur;
@@ -589,21 +661,19 @@ static int do_uninstall( void )
     cur = _dos_getvect( 0x21 );
     my_off = FP_OFF( (void far *)new21 );
     if ( FP_OFF( cur ) != my_off ) {
-        msg( "TABTSR ist nicht (mehr) der oberste INT-21h-Hook - " );
-        msg( "Deinstallation abgebrochen.\r\n" );
+        msg( "TABTSR ist nicht (mehr) der oberste INT-21h-Hook.\r\n" );
         return 1;
     }
 
-    segread( &s );                          /* CS/DS dieser (neuen) Instanz */
-    delta   = s.ds - s.cs;                  /* layout-fix: gleiches Programm */
-    res_seg = FP_SEG( cur ) + delta;        /* DGROUP-Segment der Resident.  */
+    segread( &s );
+    delta   = s.ds - s.cs;
+    res_seg = FP_SEG( cur ) + delta;
 
     sig_off    = FP_OFF( (void far *)sig );
     remote_sig = (char far *)MK_FP( res_seg, sig_off );
     for ( i = 0; sig[i]; i++ ) {
         if ( remote_sig[i] != sig[i] ) {
-            msg( "Signatur passt nicht - vermutlich ein anderes Programm " );
-            msg( "am INT 21h. Deinstallation abgebrochen.\r\n" );
+            msg( "Signatur passt nicht. Deinstallation abgebrochen.\r\n" );
             return 1;
         }
     }
@@ -620,15 +690,114 @@ static int do_uninstall( void )
 
     segread( &s );
     s.es = psp_seg;
-    r.h.ah = 0x49;                          /* DOS: Speicherblock freigeben  */
+    r.h.ah = 0x49;
     intdosx( &r, &r, &s );
 
-    msg( "TABTSR entfernt, Speicher freigegeben.\r\n" );
+    msg( "TABTSR entfernt.\r\n" );
     return 0;
 }
 
-/* -------- Installation --------------------------------------------------*/
+/* -------- Init: DOS-interne Befehle in cmd_cache laden ------------------ */
+static void load_dos_cmds( void )
+{
+    static const char * const cmds[] = {
+        "CD","CHDIR","CLS","COPY","DATE","DEL","DIR","ECHO","EXIT",
+        "FOR","GOTO","IF","MD","MKDIR","PATH","PAUSE","PROMPT",
+        "RD","REM","REN","RENAME","RMDIR","SET","TIME","TYPE",
+        "VER","VERIFY","VOL", 0
+    };
+    int i, j;
+    for ( i = 0; cmds[i] && cmd_count < CMD_MAX; i++ ) {
+        for ( j = 0; cmds[i][j] && j < NAME_LEN-1; j++ )
+            cmd_cache[cmd_count][j] = cmds[i][j];
+        cmd_cache[cmd_count][j] = 0;
+        cmd_count++;
+    }
+}
 
+/* -------- Init: Eines Verzeichnisses Executables in cmd_cache ----------- */
+static void scan_one_path_dir( char far *dir, int dlen )
+{
+    static char pat[82];
+    static unsigned char dta2[64];
+    static const char exts[3][4] = { "EXE", "COM", "BAT" };
+    union REGS r; struct SREGS s;
+    int e, i, ni, plen, dup;
+
+    for ( e = 0; e < 3 && cmd_count < CMD_MAX; e++ ) {
+        plen = 0;
+        for ( i = 0; i < dlen && plen < 76; i++ ) pat[plen++] = dir[i];
+        if ( plen > 0 && pat[plen-1] != '\\' && pat[plen-1] != '/' )
+            pat[plen++] = '\\';
+        pat[plen++] = '*'; pat[plen++] = '.';
+        pat[plen++] = exts[e][0]; pat[plen++] = exts[e][1]; pat[plen++] = exts[e][2];
+        pat[plen]   = 0;
+
+        /* DTA setzen */
+        segread( &s );
+        r.h.ah = 0x1A; r.x.dx = (unsigned)dta2;
+        intdosx( &r, &r, &s );
+
+        /* FindFirst */
+        segread( &s );
+        r.h.ah = 0x4E; r.x.cx = 0x20; r.x.dx = (unsigned)pat;
+        intdosx( &r, &r, &s );
+
+        while ( !r.x.cflag && cmd_count < CMD_MAX ) {
+            char name[9];
+            ni = 0;
+            while ( dta2[30+ni] && dta2[30+ni] != '.' && ni < 8 )
+                { name[ni] = dta2[30+ni]; ni++; }
+            name[ni] = 0;
+
+            /* Duplikat-Check */
+            dup = 0;
+            for ( i = 0; i < cmd_count; i++ ) {
+                if ( strlen_local(cmd_cache[i]) == ni &&
+                     memcmp_local(cmd_cache[i], name, ni) == 0 )
+                    { dup = 1; break; }
+            }
+            if ( !dup ) {
+                for ( i = 0; i <= ni; i++ ) cmd_cache[cmd_count][i] = name[i];
+                cmd_count++;
+            }
+
+            r.h.ah = 0x4F;
+            intdos( &r, &r );
+        }
+    }
+}
+
+/* -------- Init: PATH-Umgebungsvariable scannen -------------------------- */
+static void scan_path_env( void )
+{
+    unsigned env_seg = *(unsigned far *)MK_FP( _psp, 0x2C );
+    char far *env    = (char far *)MK_FP( env_seg, 0 );
+    static char dir[82];
+    int dlen;
+    char far *p;
+
+    while ( *env ) {
+        if ( env[0]=='P' && env[1]=='A' && env[2]=='T' && env[3]=='H' && env[4]=='=' ) {
+            p = env + 5; dlen = 0;
+            while ( *p ) {
+                if ( *p == ';' ) {
+                    if ( dlen > 0 ) scan_one_path_dir( (char far *)dir, dlen );
+                    dlen = 0;
+                } else {
+                    if ( dlen < 80 ) dir[dlen++] = *p;
+                }
+                p++;
+            }
+            if ( dlen > 0 ) scan_one_path_dir( (char far *)dir, dlen );
+            break;
+        }
+        while ( *env ) env++;
+        env++;
+    }
+}
+
+/* -------- Installation -------------------------------------------------- */
 int main( int argc, char *argv[] )
 {
     union REGS r; struct SREGS s;
@@ -639,21 +808,27 @@ int main( int argc, char *argv[] )
         return do_uninstall();
     }
 
-    msg( "TABTSR v" TABTSR_VERSION " - TAB-Completion fuer DOS\r\n" );
-    msg( "Eigener Editor, nur INT 21h/0Ah gehookt. Jetzt resident.\r\n" );
+    msg( "TABTSR v" TABTSR_VERSION
+         " - TAB/History/Pfade/Befehle/PATH\r\n" );
+    msg( "TAB=Completion  Hoch/Runter=History  Ctrl+R=Suche\r\n" );
+    msg( "Links/Rechts/Home/End/Del/Ins=Editor  /u=Deinstall\r\n" );
 
-    segread( &s );                    /* InDOS-Flag-Zeiger holen (ES:BX)    */
+    /* DOS-Befehle und PATH-Executables laden */
+    load_dos_cmds();
+    scan_path_env();
+
+    /* InDOS-Flag */
+    segread( &s );
     r.h.ah = 0x34;
     intdosx( &r, &r, &s );
     indos_ptr = (unsigned char far *)MK_FP( s.es, r.x.bx );
 
-    my_psp_seg = _psp;                /* fuer spaeteres /u merken           */
+    my_psp_seg = _psp;
 
     old21 = _dos_getvect( 0x21 );
     _dos_setvect( 0x21, new21 );
 
     para = (get_ss() - _psp) + (get_sp() / 16) + 16;
-
     _dos_keep( 0, para );
     return 0;
 }
