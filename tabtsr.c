@@ -1,276 +1,314 @@
 /*
- * TABTSR - Minimaler TSR fuer TAB-Dateinamen-Completion unter MS-DOS
- * v0.1  -  Open Watcom C (16-bit, Real Mode)
+ * TABTSR - TAB-Dateinamen-Completion fuer MS-DOS
+ * v0.2  -  Open Watcom C (16-bit, Real Mode)
  *
- * Idee
- * ----
- * COMMAND.COM liest seine Eingabezeile ueber INT 21h / AH=0Ah
- * (Buffered Input). Wir hooken INT 21h, fangen genau diese Funktion ab
- * und implementieren einen eigenen Zeilen-Editor. Bei TAB wird das
- * aktuelle Wort als Dateiname (8.3) im aktuellen Verzeichnis
- * vervollstaendigt; wiederholtes TAB zykelt durch die Treffer (wie 4DOS).
+ * Architektur (siehe CLAUDE.md fuer Details)
+ * -------------------------------------------
+ * v0.1 hookte INT 21h/AH=0Ah und implementierte einen eigenen Zeilen-Editor,
+ * der bei TAB FindFirst/FindNext *aus dem laufenden Hook heraus* aufrief.
+ * Das haengt auf echter DOS-6.22-Hardware (Re-Entranz-Problem, tiefer Stack)
+ * und ist inkompatibel mit DOSKEY (COMMAND.COM umgeht AH=0Ah, wenn DOSKEY
+ * geladen ist).
  *
- * Wichtig: Beim Eintritt in unseren 0Ah-Hook ist InDOS noch 0, weil wir
- * INT 21h *vor* dem eigentlichen DOS-Handler abfangen. Deshalb duerfen
- * wir hier gefahrlos selbst INT-21h-Funktionen (02h, 4Eh/4Fh, 1Ah, 2Fh)
- * aufrufen.
+ * v0.2 verwendet zwei Hooks:
+ *
+ *   new21 (INT 21h, AH=0Ah): scannt das aktuelle Verzeichnis EINMAL (sicher,
+ *   da wir hier InDOS=0 haben und der Stack noch flach ist), setzt
+ *   readline_active=1 und reicht den Aufruf an old21 weiter (DOSKEY oder
+ *   DOS-eigener Editor uebernimmt Pfeiltasten/History wie gewohnt).
+ *
+ *   new16 (INT 16h, AH=00h): liest Tasten *bevor* DOSKEY/DOS sie sieht.
+ *   Implementiert ein eigenes Warten (STI + Poll auf den BIOS-Keyboard-
+ *   Puffer), weil _chain_intr ein nicht-rueckkehrender Jump ist und wir das
+ *   Ergebnis sonst nicht inspizieren koennten. Bei TAB wird im bereits
+ *   gescannten file_cache gesucht (kein DOS-Call!) und das Ergebnis als
+ *   Backspace+Dateiname in eine eigene Tastatur-Queue gelegt. DOS/DOSKEY
+ *   liest diese Zeichen wie normale Tastendruecke und editiert ihre eigene
+ *   Zeile damit (Backspace loescht korrekt, Zeichen werden echoed).
  *
  * Build:
- *   wcl -bt=dos -ms -os -zq -fe=tabtsr.exe tabtsr.c
+ *   build.bat   (ruft owsetenv.bat, dann wcl -bt=dos -ms -os -zq)
  *
- * Test ZUERST in DOSBox-X oder einer VM, dann auf echter Hardware.
- * Ein fehlerhafter INT-21h-Hook kann den Rechner haengen lassen.
+ * Test ZUERST in DOSBox, dann auf echter Hardware.
  */
 
 #include <dos.h>
 #include <i86.h>
 
-/* -------- Watcom-Globals / Inline-Helfer ------------------------------ */
-
-extern unsigned _psp;                 /* Segment des PSP */
+extern unsigned _psp;
 
 unsigned get_ss( void );
 #pragma aux get_ss = "mov ax, ss" value [ax];
 unsigned get_sp( void );
 #pragma aux get_sp = "mov ax, sp" value [ax];
 
-/* -------- resident: Zustand ------------------------------------------- */
+/* -------- resident: Hook-Pointer ---------------------------------------- */
 
 static void (__interrupt __far *old21)();
-static int  busy = 0;                 /* Reentranz-Schutz fuer 0Ah        */
+static void (__interrupt __far *old16)();
 
-static unsigned char dta[64];         /* eigener DTA-Puffer (FindFirst)    */
-#define DTA_ATTR (dta[21])
-#define DTA_NAME ((char far *)&dta[30])
+/* -------- resident: Dateiname-Cache (von scan_directory gefuellt) ------- */
 
-static char comp_base[16];            /* urspruenglich getipptes Fragment  */
-static int  comp_active = 0;          /* laeuft gerade ein TAB-Zyklus?     */
-static int  comp_index  = 0;          /* welcher Treffer als naechstes     */
-static int  shown_len   = 0;          /* Laenge des aktuell gezeigten Worts*/
+#define MAX_FILES 64
+#define NAME_LEN  13                  /* 8.3 + NUL                         */
 
-/* -------- Forward-Deklarationen --------------------------------------- */
+static char          file_cache[MAX_FILES][NAME_LEN];
+static unsigned char file_is_dir[MAX_FILES];
+static int            file_count;
 
-static void do_complete( char far *data, int *plen, unsigned char maxlen );
+/* -------- resident: eigene Tastatur-Queue -------------------------------*/
 
-/* -------- Konsole / Tastatur ------------------------------------------ */
+#define QUEUE_SIZE 32
+static unsigned kbd_queue[QUEUE_SIZE];
+static int q_head = 0, q_tail = 0;
 
-static void con_out( char c )         /* INT 21h AH=02h: Zeichen ausgeben  */
+#define Q_EMPTY()  (q_head == q_tail)
+static void q_push( unsigned key )
+{
+    int next = (q_tail + 1) % QUEUE_SIZE;
+    if ( next == q_head ) return;     /* Queue voll: verwerfen             */
+    kbd_queue[q_tail] = key;
+    q_tail = next;
+}
+static unsigned q_pop( void )
+{
+    unsigned key = kbd_queue[q_head];
+    q_head = (q_head + 1) % QUEUE_SIZE;
+    return key;
+}
+
+/* -------- resident: Completion-Zustand ----------------------------------*/
+
+static char comp_base[NAME_LEN];
+static int  comp_base_len = 0;
+static int  comp_active   = 0;
+static int  comp_index    = 0;
+static int  shown_len     = 0;
+static int  readline_active = 0;
+
+/* -------- BIOS-Keyboard-Puffer (Segment 0x0040) -------------------------*/
+
+#define BIOS_SEG     0x0040
+#define KBD_HEAD_OFF 0x001A
+#define KBD_TAIL_OFF 0x001C
+#define KBD_BUF_OFF  0x001E
+#define KBD_BUF_END  0x003E
+
+static unsigned bios_peek_head( void )
+{
+    return *(unsigned far *)MK_FP( BIOS_SEG, KBD_HEAD_OFF );
+}
+static unsigned bios_peek_tail( void )
+{
+    return *(unsigned far *)MK_FP( BIOS_SEG, KBD_TAIL_OFF );
+}
+static unsigned bios_take_key( void )
+{
+    unsigned head = bios_peek_head();
+    unsigned key  = *(unsigned far *)MK_FP( BIOS_SEG, head );
+    head += 2;
+    if ( head >= KBD_BUF_END ) head = KBD_BUF_OFF;
+    *(unsigned far *)MK_FP( BIOS_SEG, KBD_HEAD_OFF ) = head;
+    return key;
+}
+
+/* -------- Verzeichnis-Scan (nur aus new21 heraus aufgerufen) ------------ */
+
+static void scan_directory( void )
+{
+    union REGS r; struct SREGS s;
+    unsigned save_dta_seg, save_dta_off;
+    unsigned char dta[64];
+    char far *fdta = (char far *)dta;
+
+    file_count = 0;
+
+    /* alte DTA sichern */
+    r.h.ah = 0x2F;
+    intdosx( &r, &r, &s );
+    save_dta_seg = s.es; save_dta_off = r.x.bx;
+
+    /* eigene DTA setzen */
+    segread( &s );
+    r.h.ah = 0x1A;
+    s.ds   = FP_SEG(fdta);
+    r.x.dx = FP_OFF(fdta);
+    intdosx( &r, &r, &s );
+
+    /* FindFirst "*.*" inkl. Verzeichnisse */
+    segread( &s );
+    r.h.ah = 0x4E;
+    r.x.cx = 0x10;
+    s.ds   = FP_SEG("*.*");
+    r.x.dx = FP_OFF("*.*");
+    intdosx( &r, &r, &s );
+
+    while ( r.x.cflag == 0 && file_count < MAX_FILES ) {
+        if ( dta[30] != '.' ) {                    /* "." / ".." ueberspringen */
+            int i;
+            for ( i = 0; i < NAME_LEN - 1 && dta[30+i]; i++ )
+                file_cache[file_count][i] = dta[30+i];
+            file_cache[file_count][i] = 0;
+            file_is_dir[file_count] = (dta[21] & 0x10) ? 1 : 0;
+            file_count++;
+        }
+        r.h.ah = 0x4F;
+        intdos( &r, &r );
+    }
+
+    /* DTA zurueck */
+    segread( &s );
+    r.h.ah = 0x1A;
+    s.ds   = save_dta_seg;
+    r.x.dx = save_dta_off;
+    intdosx( &r, &r, &s );
+}
+
+/* -------- kleine lokale String-Helfer (kein <string.h> im Hook) --------- */
+
+static int strlen_local( const char *s )
+{
+    int n = 0;
+    while ( s[n] ) n++;
+    return n;
+}
+static int memcmp_local( const char *a, const char *b, int n )
+{
+    int i;
+    for ( i = 0; i < n; i++ )
+        if ( a[i] != b[i] ) return 1;
+    return 0;
+}
+
+/* -------- TAB-Completion: sucht nur im Cache, kein DOS-Call ------------- */
+
+static void do_complete_queue( void )
+{
+    int i, target, count, matched, nl, namelen;
+
+    target  = comp_index;
+    matched = -1;
+    count   = 0;
+
+    for ( i = 0; i < file_count; i++ ) {
+        if ( comp_base_len == 0 ||
+             ( strlen_local(file_cache[i]) >= comp_base_len &&
+               memcmp_local(file_cache[i], comp_base, comp_base_len) == 0 ) ) {
+            if ( count == target ) { matched = i; break; }
+            count++;
+        }
+    }
+
+    if ( matched < 0 && target > 0 ) {             /* wrap: von vorn        */
+        comp_index = 0;
+        count = 0;
+        for ( i = 0; i < file_count; i++ ) {
+            if ( comp_base_len == 0 ||
+                 ( strlen_local(file_cache[i]) >= comp_base_len &&
+                   memcmp_local(file_cache[i], comp_base, comp_base_len) == 0 ) ) {
+                matched = i;
+                break;
+            }
+        }
+    }
+
+    if ( matched < 0 ) { comp_active = 0; return; }   /* kein Treffer       */
+
+    for ( i = 0; i < shown_len; i++ ) q_push( 0x0E08 ); /* Backspace        */
+
+    namelen = strlen_local( file_cache[matched] );
+    nl = 0;
+    for ( i = 0; i < namelen; i++ ) {
+        q_push( (unsigned char)file_cache[matched][i] );
+        nl++;
+    }
+    if ( file_is_dir[matched] ) { q_push( '\\' ); nl++; }
+
+    shown_len = nl;
+    comp_index++;
+}
+
+/* -------- INT 16h Hook: faengt Tasten ab, bevor DOSKEY/DOS sie sehen ---- */
+
+void __interrupt __far new16( union INTPACK r )
+{
+    unsigned key;
+
+    if ( r.h.ah != 0x00 ) { _chain_intr( old16 ); return; }
+
+    if ( !Q_EMPTY() ) {
+        r.x.ax = q_pop();
+        return;
+    }
+
+    /* eigenes blockierendes Warten: STI, bis BIOS-Puffer eine Taste hat */
+    _enable();
+    while ( bios_peek_head() == bios_peek_tail() ) { /* warten */ }
+    key = bios_take_key();
+
+    if ( (key & 0xFF) == 0x09 && readline_active ) {       /* TAB           */
+        do_complete_queue();
+        if ( !Q_EMPTY() ) { r.x.ax = q_pop(); return; }
+        r.x.ax = key;
+        return;
+    }
+    else if ( (key & 0xFF) == 0x0D ) {                     /* ENTER         */
+        readline_active = 0;
+        comp_active = 0; comp_base_len = 0; shown_len = 0;
+    }
+    else if ( (key & 0xFF) == 0x08 ) {                     /* Backspace     */
+        comp_active = 0;
+        if ( comp_base_len > 0 ) comp_base_len--;
+    }
+    else if ( (key & 0xFF) >= 0x20 && (key & 0xFF) < 0x7F ) { /* Printable  */
+        comp_active = 0;
+        if ( comp_base_len < NAME_LEN - 1 )
+            comp_base[comp_base_len++] = (char)(key & 0xFF);
+    }
+    else {
+        comp_active = 0;                                   /* Sondertasten  */
+    }
+
+    r.x.ax = key;
+}
+
+/* -------- INT 21h Hook: scannt Verzeichnis, reicht Zeileneingabe weiter - */
+
+void __interrupt __far new21( union INTPACK r )
+{
+    if ( r.h.ah == 0x0A ) {
+        scan_directory();
+        readline_active = 1;
+        comp_active = 0; comp_base_len = 0; shown_len = 0; comp_index = 0;
+    }
+    _chain_intr( old21 );
+}
+
+/* -------- Installation --------------------------------------------------*/
+
+static void con_out( char c )
 {
     union REGS r;
     r.h.ah = 0x02;
     r.h.dl = (unsigned char)c;
     intdos( &r, &r );
 }
-
-static void msg( char *s )            /* einfache String-Ausgabe           */
-{
-    while ( *s ) con_out( *s++ );
-}
-
-static unsigned get_key( void )       /* INT 16h AH=00h: Taste lesen       */
-{
-    union REGS r;
-    r.h.ah = 0x00;
-    int86( 0x16, &r, &r );            /* AL=ASCII, AH=Scancode             */
-    return r.x.ax;
-}
-
-/* -------- DTA / Verzeichnissuche -------------------------------------- */
-
-static void get_dta( unsigned *seg, unsigned *off )   /* INT 21h AH=2Fh    */
-{
-    union REGS r; struct SREGS s;
-    r.h.ah = 0x2F;
-    intdosx( &r, &r, &s );
-    *seg = s.es; *off = r.x.bx;
-}
-
-static void set_dta( unsigned seg, unsigned off )     /* INT 21h AH=1Ah    */
-{
-    union REGS r; struct SREGS s;
-    segread( &s );
-    r.h.ah = 0x1A;
-    s.ds = seg; r.x.dx = off;
-    intdosx( &r, &r, &s );
-}
-
-static int find_first( char far *pattern )            /* INT 21h AH=4Eh    */
-{
-    union REGS r; struct SREGS s;
-    char far *fdta = (char far *)dta;
-
-    set_dta( FP_SEG(fdta), FP_OFF(fdta) );
-    segread( &s );
-    s.ds   = FP_SEG(pattern);
-    r.x.dx = FP_OFF(pattern);
-    r.h.ah = 0x4E;
-    r.x.cx = 0x10;                    /* Normal + Verzeichnisse            */
-    intdosx( &r, &r, &s );
-    return (r.x.cflag == 0);
-}
-
-static int find_next( void )                          /* INT 21h AH=4Fh    */
-{
-    union REGS r;
-    r.h.ah = 0x4F;
-    intdos( &r, &r );
-    return (r.x.cflag == 0);
-}
-
-/* -------- TAB-Completion ---------------------------------------------- */
-
-static void do_complete( char far *data, int *plen, unsigned char maxlen )
-{
-    unsigned save_seg, save_off;
-    char pattern[20];
-    char namebuf[16];
-    int  wstart, wlen, i, k, target, count, nl;
-    int  matched = 0;
-
-    /* aktuelles Wort = letzter Lauf ohne Leerzeichen */
-    wstart = *plen;
-    while ( wstart > 0 && data[wstart-1] != ' ' ) wstart--;
-    wlen = *plen - wstart;
-
-    if ( !comp_active ) {                     /* neuen Zyklus starten      */
-        if ( wlen > 12 ) return;              /* zu lang fuers 8.3-Muster  */
-        for ( i = 0; i < wlen; i++ ) comp_base[i] = data[wstart+i];
-        comp_base[wlen] = 0;
-        comp_index  = 0;
-        shown_len   = wlen;
-        comp_active = 1;
-    }
-
-    /* Suchmuster bilden: <fragment>*   (leer -> *) */
-    k = 0;
-    for ( i = 0; comp_base[i]; i++ ) pattern[k++] = comp_base[i];
-    pattern[k++] = '*';
-    pattern[k]   = 0;
-
-    /* DTA sichern, Treffer Nr. comp_index suchen */
-    get_dta( &save_seg, &save_off );
-
-    target = comp_index;
-    if ( find_first( (char far *)pattern ) ) {
-        count = 0;
-        for (;;) {
-            if ( DTA_NAME[0] != '.' ) {       /* "." / ".." ueberspringen  */
-                if ( count == target ) { matched = 1; break; }
-                count++;
-            }
-            if ( !find_next() ) break;
-        }
-        if ( !matched && target > 0 ) {       /* ueber Ende -> Anfang      */
-            comp_index = 0;
-            if ( find_first( (char far *)pattern ) ) {
-                for (;;) {
-                    if ( DTA_NAME[0] != '.' ) { matched = 1; break; }
-                    if ( !find_next() ) break;
-                }
-            }
-        }
-    }
-
-    set_dta( save_seg, save_off );            /* COMMAND.COM-DTA zurueck   */
-
-    if ( !matched ) { con_out( 0x07 ); return; }   /* kein Treffer: piep   */
-
-    /* altes angezeigtes Wort vom Schirm + Puffer loeschen */
-    for ( i = 0; i < shown_len; i++ ) {
-        con_out( 0x08 ); con_out( ' ' ); con_out( 0x08 );
-    }
-    *plen -= shown_len;
-
-    /* Treffer einfuegen (bei Verzeichnis ein '\' anhaengen) */
-    nl = 0;
-    for ( i = 0; DTA_NAME[i] && nl < 13; i++ ) namebuf[nl++] = DTA_NAME[i];
-    if ( DTA_ATTR & 0x10 ) namebuf[nl++] = '\\';
-    namebuf[nl] = 0;
-
-    for ( i = 0; i < nl; i++ ) {
-        if ( *plen < (int)maxlen - 1 ) {
-            data[(*plen)++] = namebuf[i];
-            con_out( namebuf[i] );
-        }
-    }
-    shown_len = nl;
-    comp_index++;
-}
-
-/* -------- eigener 0Ah-Zeilen-Editor ----------------------------------- */
-
-static void do_readline( char far *buf )
-{
-    unsigned char maxlen = (unsigned char)buf[0];   /* max Zeichen        */
-    char far *data = buf + 2;                        /* Nutzdaten ab Off 2 */
-    int len = 0;
-    unsigned key;
-
-    for (;;) {
-        key = get_key();
-
-        if ( (key & 0xFF) == 0x0D ) {                /* ENTER              */
-            data[len] = 0x0D;                        /* CR-Konvention 0Ah  */
-            buf[1] = (unsigned char)len;
-            con_out( 0x0D ); con_out( 0x0A );
-            return;
-        }
-        else if ( (key & 0xFF) == 0x08 ) {           /* BACKSPACE          */
-            comp_active = 0;
-            if ( len > 0 ) {
-                len--;
-                con_out( 0x08 ); con_out( ' ' ); con_out( 0x08 );
-            }
-        }
-        else if ( (key & 0xFF) == 0x09 ) {           /* TAB -> Completion  */
-            do_complete( data, &len, maxlen );
-        }
-        else if ( (key & 0xFF) >= 0x20 && (key & 0xFF) < 0x7F ) {
-            comp_active = 0;                         /* druckbares Zeichen */
-            if ( len < (int)maxlen - 1 ) {
-                data[len++] = (char)(key & 0xFF);
-                con_out( (char)(key & 0xFF) );
-            } else {
-                con_out( 0x07 );                     /* Puffer voll: piep  */
-            }
-        }
-        /* Pfeile / Sondertasten werden in v0.1 ignoriert */
-    }
-}
-
-/* -------- INT-21h-Hook ------------------------------------------------ */
-
-void __interrupt __far new21( union INTPACK r )
-{
-    /* HINWEIS: INTPACK-Member ggf. an deine OW-Version anpassen
-       (r.w.ds / r.w.dx in 16-bit Watcom).                              */
-    if ( r.h.ah == 0x0A && !busy ) {
-        busy = 1;
-        do_readline( (char far *)MK_FP( r.w.ds, r.w.dx ) );
-        busy = 0;
-        return;                          /* IRET, NICHT weiterreichen     */
-    }
-    _chain_intr( old21 );                /* alle anderen 21h-Funktionen   */
-}
-
-/* -------- Installation ------------------------------------------------ */
+static void msg( char *s ) { while ( *s ) con_out( *s++ ); }
 
 int main( void )
 {
     unsigned para;
 
-    msg( "TABTSR v0.1 - TAB-Dateinamen-Completion fuer DOS\r\n" );
-    msg( "INT 21h/0Ah gehookt, jetzt resident.\r\n" );
+    msg( "TABTSR v0.2 - TAB-Dateinamen-Completion fuer DOS\r\n" );
+    msg( "INT 21h/0Ah + INT 16h/00h gehookt, jetzt resident.\r\n" );
 
     old21 = _dos_getvect( 0x21 );
+    old16 = _dos_getvect( 0x16 );
     _dos_setvect( 0x21, new21 );
+    _dos_setvect( 0x16, new16 );
 
-    /* Zu behaltende Paragraphen: PSP .. oberes Ende des Stacksegments.
-       (get_ss()-_psp) deckt PSP + Code + Daten ab, (get_sp()/16) den
-       benutzten Stack; +16 als Sicherheitsmarge. RISKANTESTE ZEILE -
-       bei Instabilitaet zuerst hier pruefen.                            */
     para = (get_ss() - _psp) + (get_sp() / 16) + 16;
 
     _dos_keep( 0, para );
-    return 0;                            /* wird nie erreicht             */
+    return 0;
 }
