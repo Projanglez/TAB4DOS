@@ -36,6 +36,14 @@ eigenen Editor mit TAB-Completion (4DOS-artiges Zykeln durch Treffer).
 - **InDOS == 0 beim Eintritt in den 0Ah-Hook.** Wir fangen INT 21h *vor*
   dem DOS-Handler ab, deshalb dürfen wir selbst DOS-Funktionen (02h,
   4Eh/4Fh, 1Ah/2Fh) aufrufen. Diese Invariante ist die Grundlage von allem.
+- **Im Hook ist `SS != DS`!** Der `__interrupt`-Prolog setzt DS=DGROUP, aber
+  SS bleibt der Stack des Aufrufers (COMMAND.COM). Ein `(void far*)`-Cast
+  eines **Stack**-Arrays nimmt aber DS → falsches Segment. Puffer, die DOS
+  füllt (z.B. die DTA für FindFirst), MÜSSEN **globale** Variablen sein
+  (liegen in DGROUP, dann stimmt DS:offset). Sonst schreibt DOS woanders hin
+  als wir lesen (las Stack-Müll, `dta[30]` war 0x5E, Skip von `.`/`..` ging
+  nicht). Explizite `MK_FP(seg,off)` mit übergebenem Segment (z.B. COMMAND.COMs
+  Puffer aus `r.w.ds`/`r.w.dx`) sind ok.
 - **Resident-Code: keine non-reentrant C-Runtime.** Kein `printf`/`malloc`
   im Hook.
 - **KEIN Watcom-Int-Wrapper im Resident benutzen — weder `int86` NOCH

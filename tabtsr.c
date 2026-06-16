@@ -26,7 +26,7 @@
 #include <dos.h>
 #include <i86.h>
 
-#define TABTSR_VERSION "0.3.1"        /* bei jedem Build letzte Stelle +1   */
+#define TABTSR_VERSION "0.3.2"        /* bei jedem Build letzte Stelle +1   */
 #define DEBUG_SCAN     1              /* 1 = file_count oben rechts anzeigen */
 
 extern unsigned _psp;
@@ -49,6 +49,11 @@ static unsigned char far *indos_ptr = 0;   /* INT 21h/34h, Re-Entranz-Schutz */
 static char          file_cache[MAX_FILES][NAME_LEN];
 static unsigned char file_is_dir[MAX_FILES];
 static int           file_count;
+
+/* DTA-Puffer MUSS global sein (DGROUP)! Im Interrupt-Hook ist SS != DS;
+   ein Stack-Array + (void far*)-Cast wuerde DS statt SS nehmen -> DOS
+   schreibt woanders hin als wir lesen (las Stack-Muell). */
+static unsigned char dta_buf[64];
 
 /* -------- resident: Completion-Zustand ----------------------------------*/
 
@@ -172,22 +177,21 @@ unsigned dos_findnext( void );              /* AH=4Fh, 0=ok                 */
 
 static void scan_directory( void )
 {
-    unsigned char dta[64];
     void far *save_dta;
     unsigned ok;
 
     file_count = 0;
     save_dta = dos_get_dta();
-    dos_set_dta( (void far *)dta );
+    dos_set_dta( (void far *)dta_buf );          /* global -> DS=DGROUP ok  */
 
     ok = dos_findfirst( (void far *)"*.*", 0x10 );   /* inkl. Verzeichnisse */
     while ( ok == 0 && file_count < MAX_FILES ) {
-        if ( dta[30] != '.' ) {                      /* "." / ".." weglassen */
+        if ( dta_buf[30] != '.' ) {                  /* "." / ".." weglassen */
             int i;
-            for ( i = 0; i < NAME_LEN - 1 && dta[30+i]; i++ )
-                file_cache[file_count][i] = dta[30+i];
+            for ( i = 0; i < NAME_LEN - 1 && dta_buf[30+i]; i++ )
+                file_cache[file_count][i] = dta_buf[30+i];
             file_cache[file_count][i] = 0;
-            file_is_dir[file_count] = (dta[21] & 0x10) ? 1 : 0;
+            file_is_dir[file_count] = (dta_buf[21] & 0x10) ? 1 : 0;
             file_count++;
         }
         ok = dos_findnext();
