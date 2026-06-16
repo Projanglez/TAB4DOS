@@ -97,21 +97,24 @@ static int  readline_active = 0;
 #define KBD_BUF_OFF  0x001E
 #define KBD_BUF_END  0x003E
 
+/* volatile ist hier ZWINGEND: Head/Tail werden vom Keyboard-IRQ (INT 09h)
+   asynchron geaendert. Ohne volatile zieht der Optimierer (-os) die Reads aus
+   der Warteschleife heraus -> Endlos-Hang, Puffer laeuft ueber (Test-1-Bug). */
 static unsigned bios_peek_head( void )
 {
-    return *(unsigned far *)MK_FP( BIOS_SEG, KBD_HEAD_OFF );
+    return *(volatile unsigned far *)MK_FP( BIOS_SEG, KBD_HEAD_OFF );
 }
 static unsigned bios_peek_tail( void )
 {
-    return *(unsigned far *)MK_FP( BIOS_SEG, KBD_TAIL_OFF );
+    return *(volatile unsigned far *)MK_FP( BIOS_SEG, KBD_TAIL_OFF );
 }
 static unsigned bios_take_key( void )
 {
     unsigned head = bios_peek_head();
-    unsigned key  = *(unsigned far *)MK_FP( BIOS_SEG, head );
+    unsigned key  = *(volatile unsigned far *)MK_FP( BIOS_SEG, head );
     head += 2;
     if ( head >= KBD_BUF_END ) head = KBD_BUF_OFF;
-    *(unsigned far *)MK_FP( BIOS_SEG, KBD_HEAD_OFF ) = head;
+    *(volatile unsigned far *)MK_FP( BIOS_SEG, KBD_HEAD_OFF ) = head;
     return key;
 }
 
@@ -256,6 +259,11 @@ void __interrupt __far new16( union INTPACK r )
     if ( ah == 0x00 || ah == 0x10 ) {
         if ( !Q_EMPTY() ) { r.w.ax = q_pop(); return; }
 
+        /* Ausserhalb der Zeileneingabe NICHT eingreifen: voll an BIOS/DOSKEY
+           durchreichen. So uebernimmt unser Busy-Wait nicht systemweit jeden
+           Tastatur-Read (Sicherheit fuer Editoren, Spiele usw.). */
+        if ( !readline_active ) { _chain_intr( old16 ); return; }
+
         /* eigenes blockierendes Warten: STI, bis BIOS-Puffer eine Taste hat */
         _enable();
         while ( bios_peek_head() == bios_peek_tail() ) { /* warten */ }
@@ -335,7 +343,7 @@ int main( void )
     union REGS r; struct SREGS s;
     unsigned para;
 
-    msg( "TABTSR v0.2.1 - TAB-Dateinamen-Completion fuer DOS\r\n" );
+    msg( "TABTSR v0.2.2 - TAB-Dateinamen-Completion fuer DOS\r\n" );
     msg( "INT 21h/0Ah + INT 16h (00h/10h/01h/11h) gehookt, jetzt resident.\r\n" );
 
     /* InDOS-Flag-Zeiger holen (ES:BX) fuer Re-Entranz-Schutz in new21 */
