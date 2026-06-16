@@ -1,35 +1,26 @@
 /*
  * TABTSR - TAB-Dateinamen-Completion fuer MS-DOS
- * v0.2  -  Open Watcom C (16-bit, Real Mode)
+ * v0.3  -  Open Watcom C (16-bit, Real Mode)
  *
- * Architektur (siehe CLAUDE.md fuer Details)
- * -------------------------------------------
- * v0.1 hookte INT 21h/AH=0Ah und implementierte einen eigenen Zeilen-Editor,
- * der bei TAB FindFirst/FindNext *aus dem laufenden Hook heraus* aufrief.
- * Das haengt auf echter DOS-6.22-Hardware (Re-Entranz-Problem, tiefer Stack)
- * und ist inkompatibel mit DOSKEY (COMMAND.COM umgeht AH=0Ah, wenn DOSKEY
- * geladen ist).
+ * Architektur (siehe CLAUDE.md)
+ * -----------------------------
+ * Eigenstaendiger Zeileneditor. Wir hooken NUR INT 21h / AH=0Ah und
+ * uebernehmen die Zeileneingabe komplett selbst (return == IRET, KEIN chain
+ * an DOS). Tasten lesen wir als ganz normaler Aufrufer von INT 16h (BIOS
+ * blockiert fuer uns) - wir hooken INT 16h NICHT. Damit entfaellt der ganze
+ * v0.2-Schmerz (Busy-Wait, volatile, DOSKEY-Bypass).
  *
- * v0.2 verwendet zwei Hooks:
+ * Warum das traegt (beides auf echter 386er-HW erprobt):
+ *   - Tasten als INT-16h-Aufrufer lesen: v0.1 konnte damit normal tippen.
+ *   - scan_directory (FindFirst am AH=0Ah-Eingang, InDOS==0): in v0.2 Test 2
+ *     lief der Prompt damit sauber.
+ * Neu/sicher: TAB sucht nur im bereits gescannten file_cache - KEIN DOS-Call
+ * im heissen Pfad (das war v0.1s Absturzursache).
  *
- *   new21 (INT 21h, AH=0Ah): scannt das aktuelle Verzeichnis EINMAL (sicher,
- *   da wir hier InDOS=0 haben und der Stack noch flach ist), setzt
- *   readline_active=1 und reicht den Aufruf an old21 weiter (DOSKEY oder
- *   DOS-eigener Editor uebernimmt Pfeiltasten/History wie gewohnt).
+ * v0.3 ist append-only (kein Cursor/Mid-Line-Editing), Basename im aktuellen
+ * Verzeichnis. History + Editing folgen als naechste Inkremente (DOSKEY-Ersatz).
  *
- *   new16 (INT 16h, AH=00h): liest Tasten *bevor* DOSKEY/DOS sie sieht.
- *   Implementiert ein eigenes Warten (STI + Poll auf den BIOS-Keyboard-
- *   Puffer), weil _chain_intr ein nicht-rueckkehrender Jump ist und wir das
- *   Ergebnis sonst nicht inspizieren koennten. Bei TAB wird im bereits
- *   gescannten file_cache gesucht (kein DOS-Call!) und das Ergebnis als
- *   Backspace+Dateiname in eine eigene Tastatur-Queue gelegt. DOS/DOSKEY
- *   liest diese Zeichen wie normale Tastendruecke und editiert ihre eigene
- *   Zeile damit (Backspace loescht korrekt, Zeichen werden echoed).
- *
- * Build:
- *   build.bat   (ruft owsetenv.bat, dann wcl -bt=dos -ms -os -zq)
- *
- * Test ZUERST in DOSBox, dann auf echter Hardware.
+ * Build: build.bat   Test: ZUERST DOSBox (nur Lade-Check!), dann echter 386.
  */
 
 #include <dos.h>
@@ -42,83 +33,72 @@ unsigned get_ss( void );
 unsigned get_sp( void );
 #pragma aux get_sp = "mov ax, sp" value [ax];
 
-/* -------- resident: Hook-Pointer ---------------------------------------- */
+/* -------- resident: Hook-Pointer + InDOS-Flag --------------------------- */
 
 static void (__interrupt __far *old21)();
-static void (__interrupt __far *old16)();
-
-/* InDOS-Flag-Zeiger (INT 21h/34h) — Re-Entranz-Schutz in new21 */
-static unsigned char far *indos_ptr = 0;
+static unsigned char far *indos_ptr = 0;   /* INT 21h/34h, Re-Entranz-Schutz */
 
 /* -------- resident: Dateiname-Cache (von scan_directory gefuellt) ------- */
 
 #define MAX_FILES 64
-#define NAME_LEN  13                  /* 8.3 + NUL                         */
+#define NAME_LEN  13                  /* 8.3 + NUL                          */
 
 static char          file_cache[MAX_FILES][NAME_LEN];
 static unsigned char file_is_dir[MAX_FILES];
-static int            file_count;
-
-/* -------- resident: eigene Tastatur-Queue -------------------------------*/
-
-#define QUEUE_SIZE 32
-static unsigned kbd_queue[QUEUE_SIZE];
-static int q_head = 0, q_tail = 0;
-
-#define Q_EMPTY()  (q_head == q_tail)
-static void q_push( unsigned key )
-{
-    int next = (q_tail + 1) % QUEUE_SIZE;
-    if ( next == q_head ) return;     /* Queue voll: verwerfen             */
-    kbd_queue[q_tail] = key;
-    q_tail = next;
-}
-static unsigned q_pop( void )
-{
-    unsigned key = kbd_queue[q_head];
-    q_head = (q_head + 1) % QUEUE_SIZE;
-    return key;
-}
+static int           file_count;
 
 /* -------- resident: Completion-Zustand ----------------------------------*/
 
-static char comp_base[NAME_LEN];
+static char comp_base[NAME_LEN];      /* getippter Stem (Praefix)           */
 static int  comp_base_len = 0;
-static int  comp_active   = 0;
-static int  comp_index    = 0;
-static int  shown_len     = 0;
-static int  readline_active = 0;
+static int  comp_active    = 0;       /* 1 = wir zykeln gerade durch Treffer */
+static int  comp_index     = 0;
+static int  shown_len      = 0;       /* aktuell auf dem Schirm: Stem o. Name */
 
-/* -------- BIOS-Keyboard-Puffer (Segment 0x0040) -------------------------*/
+/* -------- kleine lokale String-Helfer (kein <string.h> im Resident) ----- */
 
-#define BIOS_SEG     0x0040
-#define KBD_HEAD_OFF 0x001A
-#define KBD_TAIL_OFF 0x001C
-#define KBD_BUF_OFF  0x001E
-#define KBD_BUF_END  0x003E
-
-/* volatile ist hier ZWINGEND: Head/Tail werden vom Keyboard-IRQ (INT 09h)
-   asynchron geaendert. Ohne volatile zieht der Optimierer (-os) die Reads aus
-   der Warteschleife heraus -> Endlos-Hang, Puffer laeuft ueber (Test-1-Bug). */
-static unsigned bios_peek_head( void )
+static int strlen_local( const char *s )
 {
-    return *(volatile unsigned far *)MK_FP( BIOS_SEG, KBD_HEAD_OFF );
+    int n = 0;
+    while ( s[n] ) n++;
+    return n;
 }
-static unsigned bios_peek_tail( void )
+/* case-insensitiv: file_cache ist GROSS (DTA), comp_base meist klein.
+   FAT16-Case-Insensitivity gilt nur fuer DOS' eigenen Vergleich. */
+static int memcmp_local( const char *a, const char *b, int n )
 {
-    return *(volatile unsigned far *)MK_FP( BIOS_SEG, KBD_TAIL_OFF );
-}
-static unsigned bios_take_key( void )
-{
-    unsigned head = bios_peek_head();
-    unsigned key  = *(volatile unsigned far *)MK_FP( BIOS_SEG, head );
-    head += 2;
-    if ( head >= KBD_BUF_END ) head = KBD_BUF_OFF;
-    *(volatile unsigned far *)MK_FP( BIOS_SEG, KBD_HEAD_OFF ) = head;
-    return key;
+    int i; char ca, cb;
+    for ( i = 0; i < n; i++ ) {
+        ca = a[i]; cb = b[i];
+        if ( ca >= 'a' && ca <= 'z' ) ca -= 0x20;
+        if ( cb >= 'a' && cb <= 'z' ) cb -= 0x20;
+        if ( ca != cb ) return 1;
+    }
+    return 0;
 }
 
-/* -------- Verzeichnis-Scan (nur aus new21 heraus aufgerufen) ------------ */
+/* -------- Konsolen-Ausgabe via INT 21h/02h ------------------------------ */
+
+static void con_out( char c )
+{
+    union REGS r;
+    r.h.ah = 0x02;
+    r.h.dl = (unsigned char)c;
+    intdos( &r, &r );
+}
+static void msg( char *s ) { while ( *s ) con_out( *s++ ); }
+
+/* -------- Taste lesen via INT 16h/00h (wir sind Aufrufer, kein Hook) ---- */
+
+static unsigned get_key( void )
+{
+    union REGS r;
+    r.h.ah = 0x00;
+    int86( 0x16, &r, &r );
+    return r.w.ax;                     /* AL=ASCII, AH=Scancode             */
+}
+
+/* -------- Verzeichnis-Scan: einmal am Eingang von do_readline ----------- */
 
 static void scan_directory( void )
 {
@@ -129,21 +109,18 @@ static void scan_directory( void )
 
     file_count = 0;
 
-    /* alte DTA sichern */
-    segread( &s );
+    segread( &s );                    /* alte DTA sichern (ES:BX)           */
     r.h.ah = 0x2F;
     intdosx( &r, &r, &s );
     save_dta_seg = s.es; save_dta_off = r.x.bx;
 
-    /* eigene DTA setzen */
-    segread( &s );
+    segread( &s );                    /* eigene DTA setzen                  */
     r.h.ah = 0x1A;
     s.ds   = FP_SEG(fdta);
     r.x.dx = FP_OFF(fdta);
     intdosx( &r, &r, &s );
 
-    /* FindFirst "*.*" inkl. Verzeichnisse */
-    segread( &s );
+    segread( &s );                    /* FindFirst "*.*" inkl. Verzeichnisse */
     r.h.ah = 0x4E;
     r.x.cx = 0x10;
     s.ds   = FP_SEG("*.*");
@@ -151,7 +128,7 @@ static void scan_directory( void )
     intdosx( &r, &r, &s );
 
     while ( r.x.cflag == 0 && file_count < MAX_FILES ) {
-        if ( dta[30] != '.' ) {                    /* "." / ".." ueberspringen */
+        if ( dta[30] != '.' ) {                    /* "." / ".." weglassen  */
             int i;
             for ( i = 0; i < NAME_LEN - 1 && dta[30+i]; i++ )
                 file_cache[file_count][i] = dta[30+i];
@@ -163,48 +140,39 @@ static void scan_directory( void )
         intdos( &r, &r );
     }
 
-    /* DTA zurueck */
-    segread( &s );
+    segread( &s );                    /* DTA zurueck                        */
     r.h.ah = 0x1A;
     s.ds   = save_dta_seg;
     r.x.dx = save_dta_off;
     intdosx( &r, &r, &s );
 }
 
-/* -------- kleine lokale String-Helfer (kein <string.h> im Hook) --------- */
+/* -------- TAB-Completion: sucht im Cache, schreibt direkt in Puffer+Schirm */
 
-static int strlen_local( const char *s )
+static void do_complete( unsigned bseg, unsigned boff, int *plen )
 {
-    int n = 0;
-    while ( s[n] ) n++;
-    return n;
-}
-/* Case-insensitiver Vergleich: file_cache haelt DTA-Namen GROSS, comp_base
-   die roh getippten (meist kleinen) Tasten. FAT16-Case-Insensitivity gilt nur
-   fuer DOS' eigenen Vergleich — wir matchen hier selbst, also upcasen. */
-static int memcmp_local( const char *a, const char *b, int n )
-{
-    int i;
-    char ca, cb;
-    for ( i = 0; i < n; i++ ) {
-        ca = a[i]; cb = b[i];
-        if ( ca >= 'a' && ca <= 'z' ) ca -= 0x20;
-        if ( cb >= 'a' && cb <= 'z' ) cb -= 0x20;
-        if ( ca != cb ) return 1;
+    char far *buf = (char far *)MK_FP( bseg, boff );
+    int maxlen = (unsigned char)buf[0];
+    int len = *plen;
+    int stem_start, i, target, count, matched, namelen, addlen, avail;
+
+    /* Bei frischer Completion (nicht am Zykeln): Stem = letztes Token
+       (zurueck bis Space oder Backslash) aus dem aktuellen Puffer ziehen. */
+    if ( !comp_active ) {
+        stem_start = len;
+        while ( stem_start > 0 &&
+                buf[2+stem_start-1] != ' ' && buf[2+stem_start-1] != '\\' )
+            stem_start--;
+        comp_base_len = len - stem_start;
+        if ( comp_base_len > NAME_LEN - 1 ) comp_base_len = NAME_LEN - 1;
+        for ( i = 0; i < comp_base_len; i++ )
+            comp_base[i] = buf[2+stem_start+i];
+        comp_index = 0;
+        shown_len  = comp_base_len;   /* der getippte Stem ist gerade sichtbar */
     }
-    return 0;
-}
 
-/* -------- TAB-Completion: sucht nur im Cache, kein DOS-Call ------------- */
-
-static void do_complete_queue( void )
-{
-    int i, target, count, matched, nl, namelen, erase;
-
-    target  = comp_index;
-    matched = -1;
-    count   = 0;
-
+    /* Treffer Nr. comp_index suchen (Praefix comp_base, case-insensitiv) */
+    target = comp_index; matched = -1; count = 0;
     for ( i = 0; i < file_count; i++ ) {
         if ( comp_base_len == 0 ||
              ( strlen_local(file_cache[i]) >= comp_base_len &&
@@ -213,149 +181,116 @@ static void do_complete_queue( void )
             count++;
         }
     }
-
-    if ( matched < 0 && target > 0 ) {             /* wrap: von vorn        */
+    if ( matched < 0 && target > 0 ) {            /* ueber Ende: wrap        */
         comp_index = 0;
         for ( i = 0; i < file_count; i++ ) {
             if ( comp_base_len == 0 ||
                  ( strlen_local(file_cache[i]) >= comp_base_len &&
                    memcmp_local(file_cache[i], comp_base, comp_base_len) == 0 ) ) {
-                matched = i;
-                break;
+                matched = i; break;
             }
         }
     }
-
-    if ( matched < 0 ) { comp_active = 0; return; }   /* kein Treffer       */
-
-    /* Erste TAB: getipptes Praefix (comp_base_len) loeschen.
-       Folge-TABs (Zykeln): vorigen Treffer (shown_len) loeschen. */
-    erase = comp_active ? shown_len : comp_base_len;
-    for ( i = 0; i < erase; i++ ) q_push( 0x0E08 );   /* Backspace          */
+    if ( matched < 0 ) { con_out( 0x07 ); comp_active = 0; return; } /* Beep */
 
     namelen = strlen_local( file_cache[matched] );
-    nl = 0;
-    for ( i = 0; i < namelen; i++ ) {
-        q_push( (unsigned char)file_cache[matched][i] );
-        nl++;
-    }
-    if ( file_is_dir[matched] ) { q_push( '\\' ); nl++; }
+    addlen  = namelen + ( file_is_dir[matched] ? 1 : 0 );
 
-    shown_len   = nl;
+    /* Passt der Treffer (nach Loeschen des sichtbaren Teils) in den Puffer? */
+    avail = (maxlen - 1) - (len - shown_len);
+    if ( addlen > avail ) { con_out( 0x07 ); comp_active = 0; return; }
+
+    for ( i = 0; i < shown_len; i++ )             /* sichtbaren Teil loeschen */
+        { con_out(0x08); con_out(' '); con_out(0x08); }
+    len -= shown_len;
+
+    for ( i = 0; i < namelen; i++ ) {             /* Treffer schreiben       */
+        buf[2+len] = file_cache[matched][i];
+        con_out( file_cache[matched][i] );
+        len++;
+    }
+    if ( file_is_dir[matched] ) { buf[2+len] = '\\'; con_out('\\'); len++; }
+
+    shown_len   = addlen;
     comp_active = 1;
     comp_index++;
+    *plen = len;
 }
 
-/* -------- INT 16h Hook: faengt Tasten ab, bevor DOSKEY/DOS sie sehen ---- */
+/* -------- eigener Zeilen-Editor (haengt im AH=0Ah-Hook) ----------------- */
 
-void __interrupt __far new16( union INTPACK r )
+static void do_readline( unsigned bseg, unsigned boff )
 {
-    unsigned char ah = r.h.ah;
-    unsigned key;
+    char far *buf = (char far *)MK_FP( bseg, boff );
+    int maxlen = (unsigned char)buf[0];
+    int len = 0;
+    unsigned k; unsigned char ascii;
 
-    /* AH=00h (Standard) UND AH=10h (Enhanced) sind blockierendes Lesen.
-       Beide muessen wir abfangen: DOS/DOSKEY nutzen auf 386ern mit
-       Enhanced-Keyboard-BIOS oft 10h/11h statt 00h/01h. */
-    if ( ah == 0x00 || ah == 0x10 ) {
-        if ( !Q_EMPTY() ) { r.w.ax = q_pop(); return; }
+    scan_directory();                 /* sicher: InDOS==0, flacher Stack    */
+    comp_active = 0; comp_base_len = 0; shown_len = 0; comp_index = 0;
 
-        /* Ausserhalb der Zeileneingabe NICHT eingreifen: voll an BIOS/DOSKEY
-           durchreichen. So uebernimmt unser Busy-Wait nicht systemweit jeden
-           Tastatur-Read (Sicherheit fuer Editoren, Spiele usw.). */
-        if ( !readline_active ) { _chain_intr( old16 ); return; }
+    for ( ;; ) {
+        k = get_key();
+        ascii = (unsigned char)( k & 0xFF );
 
-        /* eigenes blockierendes Warten: STI, bis BIOS-Puffer eine Taste hat */
-        _enable();
-        while ( bios_peek_head() == bios_peek_tail() ) { /* warten */ }
-        key = bios_take_key();
-
-        if ( (key & 0xFF) == 0x09 && readline_active ) {   /* TAB           */
-            do_complete_queue();
-            if ( !Q_EMPTY() ) { r.w.ax = q_pop(); return; }
-            r.w.ax = key;
+        if ( ascii == 0x0D ) {                    /* ENTER                  */
+            buf[1] = (char)len;
+            buf[2+len] = 0x0D;
+            con_out(0x0D); con_out(0x0A);
             return;
         }
-        else if ( (key & 0xFF) == 0x0D ) {                 /* ENTER         */
-            readline_active = 0;
-            comp_active = 0; comp_base_len = 0; shown_len = 0;
-        }
-        else if ( (key & 0xFF) == 0x08 ) {                 /* Backspace     */
+        else if ( ascii == 0x08 ) {               /* Backspace              */
+            if ( len > 0 ) {
+                len--;
+                con_out(0x08); con_out(' '); con_out(0x08);
+            }
             comp_active = 0;
-            if ( comp_base_len > 0 ) comp_base_len--;
         }
-        else if ( (key & 0xFF) >= 0x20 && (key & 0xFF) < 0x7F ) { /* Printbl */
+        else if ( ascii == 0x09 ) {               /* TAB                    */
+            do_complete( bseg, boff, &len );
+        }
+        else if ( ascii >= 0x20 && ascii < 0x7F ) { /* druckbar             */
+            if ( len < maxlen - 1 ) {
+                buf[2+len] = ascii;
+                con_out( ascii );
+                len++;
+            }
             comp_active = 0;
-            if ( comp_base_len < NAME_LEN - 1 )
-                comp_base[comp_base_len++] = (char)(key & 0xFF);
         }
         else {
-            comp_active = 0;                               /* Sondertasten  */
+            comp_active = 0;                       /* Extended/ignoriert     */
         }
-
-        r.w.ax = key;
-        return;
     }
-
-    /* AH=01h (Status) UND AH=11h (Enhanced-Status): wenn unsere Queue noch
-       Completion-Zeichen enthaelt, MUESSEN wir "Taste verfuegbar" melden —
-       sonst pollt DOS/DOSKEY den BIOS-Puffer (leer) und holt den Rest des
-       Dateinamens nie ab (halb eingefuegter Name / scheinbarer Haenger). */
-    if ( ah == 0x01 || ah == 0x11 ) {
-        if ( !Q_EMPTY() ) {
-            r.w.ax     = kbd_queue[q_head];   /* Peek, nicht poppen         */
-            r.w.flags &= ~0x0040;             /* ZF=0 -> Taste verfuegbar   */
-            return;
-        }
-        _chain_intr( old16 );                 /* sonst BIOS fragen          */
-        return;
-    }
-
-    _chain_intr( old16 );                     /* alle anderen Funktionen    */
 }
 
-/* -------- INT 21h Hook: scannt Verzeichnis, reicht Zeileneingabe weiter - */
+/* -------- INT 21h Hook: AH=0Ah selbst behandeln, sonst chainen ---------- */
 
 void __interrupt __far new21( union INTPACK r )
 {
-    /* Nur scannen, wenn DOS NICHT re-entrant ist (InDOS==0). Sonst wuerden
-       unsere DOS-Calls in scan_directory den DOS-Zustand korrumpieren. */
     if ( r.h.ah == 0x0A && *indos_ptr == 0 ) {
-        scan_directory();
-        readline_active = 1;
-        comp_active = 0; comp_base_len = 0; shown_len = 0; comp_index = 0;
+        do_readline( r.w.ds, r.w.dx );
+        return;                       /* IRET - wir haben 0Ah erledigt      */
     }
     _chain_intr( old21 );
 }
 
 /* -------- Installation --------------------------------------------------*/
 
-static void con_out( char c )
-{
-    union REGS r;
-    r.h.ah = 0x02;
-    r.h.dl = (unsigned char)c;
-    intdos( &r, &r );
-}
-static void msg( char *s ) { while ( *s ) con_out( *s++ ); }
-
 int main( void )
 {
     union REGS r; struct SREGS s;
     unsigned para;
 
-    msg( "TABTSR v0.2.2 - TAB-Dateinamen-Completion fuer DOS\r\n" );
-    msg( "INT 21h/0Ah + INT 16h (00h/10h/01h/11h) gehookt, jetzt resident.\r\n" );
+    msg( "TABTSR v0.3 - TAB-Dateinamen-Completion fuer DOS\r\n" );
+    msg( "Eigener Editor, nur INT 21h/0Ah gehookt. Jetzt resident.\r\n" );
 
-    /* InDOS-Flag-Zeiger holen (ES:BX) fuer Re-Entranz-Schutz in new21 */
-    segread( &s );
+    segread( &s );                    /* InDOS-Flag-Zeiger holen (ES:BX)    */
     r.h.ah = 0x34;
     intdosx( &r, &r, &s );
     indos_ptr = (unsigned char far *)MK_FP( s.es, r.x.bx );
 
     old21 = _dos_getvect( 0x21 );
-    old16 = _dos_getvect( 0x16 );
     _dos_setvect( 0x21, new21 );
-    _dos_setvect( 0x16, new16 );
 
     para = (get_ss() - _psp) + (get_sp() / 16) + 16;
 
