@@ -26,7 +26,7 @@
 #include <dos.h>
 #include <i86.h>
 
-#define TABTSR_VERSION "0.3.3"        /* bei jedem Build letzte Stelle +1   */
+#define TABTSR_VERSION "0.3.4"        /* bei jedem Build letzte Stelle +1   */
 #define DEBUG_SCAN     1              /* 1 = file_count oben rechts anzeigen */
 
 extern unsigned _psp;
@@ -202,11 +202,13 @@ static void scan_directory( void )
 
 /* -------- TAB-Completion: sucht im Cache, schreibt direkt in Puffer+Schirm */
 
-static void do_complete( unsigned bseg, unsigned boff, int *plen )
+/* len per WERT rein und raus! NICHT als Pointer: &len waere ein near-Pointer
+   auf eine Stack-Variable, der ueber DS dereferenziert wird - im Hook ist aber
+   SS != DS, also laese do_complete Muell (war L=0xCC statt 2). */
+static int do_complete( unsigned bseg, unsigned boff, int len )
 {
     char far *buf = (char far *)MK_FP( bseg, boff );
     int maxlen = (unsigned char)buf[0];
-    int len = *plen;
     int stem_start, i, target, count, matched, namelen, addlen, avail;
 
     /* Bei frischer Completion (nicht am Zykeln): Stem = letztes Token
@@ -254,14 +256,14 @@ static void do_complete( unsigned bseg, unsigned boff, int *plen )
             }
         }
     }
-    if ( matched < 0 ) { con_out( 0x07 ); comp_active = 0; return; } /* Beep */
+    if ( matched < 0 ) { con_out( 0x07 ); comp_active = 0; return len; } /* Beep */
 
     namelen = strlen_local( file_cache[matched] );
     addlen  = namelen + ( file_is_dir[matched] ? 1 : 0 );
 
     /* Passt der Treffer (nach Loeschen des sichtbaren Teils) in den Puffer? */
     avail = (maxlen - 1) - (len - shown_len);
-    if ( addlen > avail ) { con_out( 0x07 ); comp_active = 0; return; }
+    if ( addlen > avail ) { con_out( 0x07 ); comp_active = 0; return len; }
 
     for ( i = 0; i < shown_len; i++ )             /* sichtbaren Teil loeschen */
         { con_out(0x08); con_out(' '); con_out(0x08); }
@@ -277,7 +279,7 @@ static void do_complete( unsigned bseg, unsigned boff, int *plen )
     shown_len   = addlen;
     comp_active = 1;
     comp_index++;
-    *plen = len;
+    return len;
 }
 
 /* -------- eigener Zeilen-Editor (haengt im AH=0Ah-Hook) ----------------- */
@@ -317,7 +319,7 @@ static void do_readline( unsigned bseg, unsigned boff )
             comp_active = 0;
         }
         else if ( ascii == 0x09 ) {               /* TAB                    */
-            do_complete( bseg, boff, &len );
+            len = do_complete( bseg, boff, len );
         }
         else if ( ascii >= 0x20 && ascii < 0x7F ) { /* druckbar             */
             if ( len < maxlen - 1 ) {

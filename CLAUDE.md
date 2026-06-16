@@ -44,6 +44,11 @@ eigenen Editor mit TAB-Completion (4DOS-artiges Zykeln durch Treffer).
   als wir lesen (las Stack-Müll, `dta[30]` war 0x5E, Skip von `.`/`..` ging
   nicht). Explizite `MK_FP(seg,off)` mit übergebenem Segment (z.B. COMMAND.COMs
   Puffer aus `r.w.ds`/`r.w.dx`) sind ok.
+- **Aus demselben Grund: KEINE `&stackvar`-Pointer über Funktionsgrenzen im
+  Hook!** `&local` ist ein *near*-Pointer (Offset), den die gerufene Funktion
+  über DS dereferenziert — die Variable liegt aber auf SS. Im Hook (SS!=DS)
+  liest sie Müll. War der Grund, warum TAB-Completion `len` als 0xCC statt 2
+  sah. Lösung: Werte per Wert übergeben und zurückgeben (oder Globals nutzen).
 - **Resident-Code: keine non-reentrant C-Runtime.** Kein `printf`/`malloc`
   im Hook.
 - **KEIN Watcom-Int-Wrapper im Resident benutzen — weder `int86` NOCH
