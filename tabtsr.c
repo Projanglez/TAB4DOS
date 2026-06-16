@@ -26,8 +26,8 @@
 #include <dos.h>
 #include <i86.h>
 
-#define TABTSR_VERSION "0.3.4"        /* bei jedem Build letzte Stelle +1   */
-#define DEBUG_SCAN     1              /* 1 = file_count oben rechts anzeigen */
+#define TABTSR_VERSION "0.3.5"        /* bei jedem Build letzte Stelle +1   */
+#define DEBUG_SCAN     0              /* 1 = file_count oben rechts anzeigen */
 
 extern unsigned _psp;
 
@@ -40,6 +40,22 @@ unsigned get_sp( void );
 
 static void (__interrupt __far *old21)();
 static unsigned char far *indos_ptr = 0;   /* INT 21h/34h, Re-Entranz-Schutz */
+
+/* -------- resident: Erkennung fuer /u (Deinstallation) ------------------
+   Eine neue Programminstanz (gestartet mit /u) muss die RESIDENTE Kopie im
+   Speicher wiederfinden, OHNE dass beide je miteinander kommunizieren. Trick:
+   Beide Instanzen sind dieselbe .exe, also liegen new21/sig/old21/my_psp_seg
+   bei JEDEM Lauf am GLEICHEN Offset innerhalb von CS bzw. DGROUP (nur die
+   Segment-ADRESSE, an die DOS laedt, ist pro Lauf anders). Daher:
+   1. aktueller INT-21h-Vektor holen, Offset mit Offset von new21 vergleichen
+      (sind wir ueberhaupt noch der oberste Hook?).
+   2. DGROUP-Segment der residenten Instanz = CS_dort + (DS-CS dieser neuen
+      Instanz) - die Differenz ist layout-fix, da gleiches Programm.
+   3. Signatur an bekanntem Offset gegenlesen, um Zufallstreffer auszuschliessen.
+   4. my_psp_seg (auch resident, vom Install gesetzt) liefert direkt das
+      Speicherblock-Segment fuer die Freigabe (AH=49h). */
+static const char sig[] = "TABTSR-RES-1";
+static unsigned my_psp_seg = 0;            /* beim Install: _psp dieser Instanz */
 
 /* -------- resident: Dateiname-Cache (von scan_directory gefuellt) ------- */
 
@@ -346,12 +362,75 @@ void __interrupt __far new21( union INTPACK r )
     _chain_intr( old21 );
 }
 
+/* -------- Deinstallation (/u) --------------------------------------------
+   Laeuft NICHT resident - ganz normaler Programmstart, daher sind intdosx/
+   int86/printf hier alle unproblematisch (die Resident-Regeln gelten nur fuer
+   den Hook). Siehe Kommentar bei "sig"/"my_psp_seg" oben fuer den Trick. */
+static int do_uninstall( void )
+{
+    void far *cur;
+    unsigned my_off, delta, res_seg, sig_off, psp_off, old21_off;
+    struct SREGS s;
+    union REGS r;
+    char far *remote_sig;
+    void far *far *p_old21;
+    unsigned far *p_psp;
+    void far *old_vec;
+    unsigned psp_seg;
+    int i;
+
+    cur = _dos_getvect( 0x21 );
+    my_off = FP_OFF( (void far *)new21 );
+    if ( FP_OFF( cur ) != my_off ) {
+        msg( "TABTSR ist nicht (mehr) der oberste INT-21h-Hook - " );
+        msg( "Deinstallation abgebrochen.\r\n" );
+        return 1;
+    }
+
+    segread( &s );                          /* CS/DS dieser (neuen) Instanz */
+    delta   = s.ds - s.cs;                  /* layout-fix: gleiches Programm */
+    res_seg = FP_SEG( cur ) + delta;        /* DGROUP-Segment der Resident.  */
+
+    sig_off    = FP_OFF( (void far *)sig );
+    remote_sig = (char far *)MK_FP( res_seg, sig_off );
+    for ( i = 0; sig[i]; i++ ) {
+        if ( remote_sig[i] != sig[i] ) {
+            msg( "Signatur passt nicht - vermutlich ein anderes Programm " );
+            msg( "am INT 21h. Deinstallation abgebrochen.\r\n" );
+            return 1;
+        }
+    }
+
+    psp_off = FP_OFF( (void far *)&my_psp_seg );
+    p_psp   = (unsigned far *)MK_FP( res_seg, psp_off );
+    psp_seg = *p_psp;
+
+    old21_off = FP_OFF( (void far *)&old21 );
+    p_old21   = (void far * far *)MK_FP( res_seg, old21_off );
+    old_vec   = *p_old21;
+
+    _dos_setvect( 0x21, (void (__interrupt __far *)())old_vec );
+
+    segread( &s );
+    s.es = psp_seg;
+    r.h.ah = 0x49;                          /* DOS: Speicherblock freigeben  */
+    intdosx( &r, &r, &s );
+
+    msg( "TABTSR entfernt, Speicher freigegeben.\r\n" );
+    return 0;
+}
+
 /* -------- Installation --------------------------------------------------*/
 
-int main( void )
+int main( int argc, char *argv[] )
 {
     union REGS r; struct SREGS s;
     unsigned para;
+
+    if ( argc > 1 && (argv[1][0] == '/' || argv[1][0] == '-') &&
+         (argv[1][1] == 'u' || argv[1][1] == 'U') && argv[1][2] == 0 ) {
+        return do_uninstall();
+    }
 
     msg( "TABTSR v" TABTSR_VERSION " - TAB-Completion fuer DOS\r\n" );
     msg( "Eigener Editor, nur INT 21h/0Ah gehookt. Jetzt resident.\r\n" );
@@ -360,6 +439,8 @@ int main( void )
     r.h.ah = 0x34;
     intdosx( &r, &r, &s );
     indos_ptr = (unsigned char far *)MK_FP( s.es, r.x.bx );
+
+    my_psp_seg = _psp;                /* fuer spaeteres /u merken           */
 
     old21 = _dos_getvect( 0x21 );
     _dos_setvect( 0x21, new21 );
