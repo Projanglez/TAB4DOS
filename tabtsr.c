@@ -102,37 +102,67 @@ unsigned get_key( void );
     "int 0x16"          \
     value [ax];         /* AL=ASCII, AH=Scancode */
 
+/* -------- Direkte INT-21h-Helfer (feste Opcodes, NICHT intdos/intdosx) ---
+   intdos/intdosx versagen wie int86 im residenten Kontext (Int-Dispatch-
+   Wrapper). Hier per #pragma aux mit literalem "int 0x21". DOS-Carry kommt
+   ueber sbb ax,ax (CF -> 0/0xFFFF) zurueck. Far-Pointer in DX:AX. */
+
+void far *dos_get_dta( void );              /* AH=2Fh -> DTA (ES:BX)        */
+#pragma aux dos_get_dta =   \
+    "mov ah,0x2F"           \
+    "int 0x21"              \
+    "mov ax,bx"             \
+    "mov dx,es"             \
+    value  [dx ax]          \
+    modify [bx cx si di es];
+
+void dos_set_dta( void far *p );            /* AH=1Ah, DS:DX = p            */
+#pragma aux dos_set_dta =   \
+    "push ds"               \
+    "mov ds,dx"             \
+    "mov dx,ax"             \
+    "mov ah,0x1A"           \
+    "int 0x21"              \
+    "pop ds"                \
+    parm   [dx ax]          \
+    modify [ax bx cx si di es];
+
+unsigned dos_findfirst( void far *pat, unsigned attr );  /* AH=4Eh, 0=ok    */
+#pragma aux dos_findfirst = \
+    "push ds"               \
+    "mov ds,dx"             \
+    "mov dx,ax"             \
+    "mov ah,0x4E"           \
+    "int 0x21"              \
+    "pop ds"                \
+    "sbb ax,ax"             \
+    parm   [dx ax] [cx]     \
+    value  [ax]             \
+    modify [bx cx dx si di es];
+
+unsigned dos_findnext( void );              /* AH=4Fh, 0=ok                 */
+#pragma aux dos_findnext =  \
+    "mov ah,0x4F"           \
+    "int 0x21"              \
+    "sbb ax,ax"             \
+    value  [ax]             \
+    modify [bx cx dx si di es];
+
 /* -------- Verzeichnis-Scan: einmal am Eingang von do_readline ----------- */
 
 static void scan_directory( void )
 {
-    union REGS r; struct SREGS s;
-    unsigned save_dta_seg, save_dta_off;
     unsigned char dta[64];
-    char far *fdta = (char far *)dta;
+    void far *save_dta;
+    unsigned ok;
 
     file_count = 0;
+    save_dta = dos_get_dta();
+    dos_set_dta( (void far *)dta );
 
-    segread( &s );                    /* alte DTA sichern (ES:BX)           */
-    r.h.ah = 0x2F;
-    intdosx( &r, &r, &s );
-    save_dta_seg = s.es; save_dta_off = r.x.bx;
-
-    segread( &s );                    /* eigene DTA setzen                  */
-    r.h.ah = 0x1A;
-    s.ds   = FP_SEG(fdta);
-    r.x.dx = FP_OFF(fdta);
-    intdosx( &r, &r, &s );
-
-    segread( &s );                    /* FindFirst "*.*" inkl. Verzeichnisse */
-    r.h.ah = 0x4E;
-    r.x.cx = 0x10;
-    s.ds   = FP_SEG("*.*");
-    r.x.dx = FP_OFF("*.*");
-    intdosx( &r, &r, &s );
-
-    while ( r.x.cflag == 0 && file_count < MAX_FILES ) {
-        if ( dta[30] != '.' ) {                    /* "." / ".." weglassen  */
+    ok = dos_findfirst( (void far *)"*.*", 0x10 );   /* inkl. Verzeichnisse */
+    while ( ok == 0 && file_count < MAX_FILES ) {
+        if ( dta[30] != '.' ) {                      /* "." / ".." weglassen */
             int i;
             for ( i = 0; i < NAME_LEN - 1 && dta[30+i]; i++ )
                 file_cache[file_count][i] = dta[30+i];
@@ -140,15 +170,10 @@ static void scan_directory( void )
             file_is_dir[file_count] = (dta[21] & 0x10) ? 1 : 0;
             file_count++;
         }
-        r.h.ah = 0x4F;
-        intdos( &r, &r );
+        ok = dos_findnext();
     }
 
-    segread( &s );                    /* DTA zurueck                        */
-    r.h.ah = 0x1A;
-    s.ds   = save_dta_seg;
-    r.x.dx = save_dta_off;
-    intdosx( &r, &r, &s );
+    dos_set_dta( save_dta );
 }
 
 /* -------- TAB-Completion: sucht im Cache, schreibt direkt in Puffer+Schirm */

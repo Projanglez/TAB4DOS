@@ -38,13 +38,17 @@ eigenen Editor mit TAB-Completion (4DOS-artiges Zykeln durch Treffer).
   4Eh/4Fh, 1Ah/2Fh) aufrufen. Diese Invariante ist die Grundlage von allem.
 - **Resident-Code: keine non-reentrant C-Runtime.** Kein `printf`/`malloc`
   im Hook.
-- **`int86` NICHT im Resident benutzen!** `int86` muss eine *variable*
-  Int-Nummer ausführen (Dispatch/selbstmodifizierend) und versagt im
-  residenten Interrupt-Kontext — die Taste wurde nie konsumiert, Tastatur-
-  Puffer lief über, „Eingabe tot + Beep". War (zusammen mit `__STK`) die
-  Ursache der HW-Hänger. Stattdessen: **direkter `INT` per `#pragma aux`**
-  (feste Opcode-Nummer, z.B. `get_key` mit `int 0x16`). `intdos`/`intdosx`/
-  `segread` sind ok (feste Nummer 21h). Per `wdis` verifiziert.
+- **KEIN Watcom-Int-Wrapper im Resident benutzen — weder `int86` NOCH
+  `intdos`/`intdosx`!** Alle laufen über denselben Int-Dispatch-Wrapper, der
+  im residenten Interrupt-Kontext versagt (auf HW bestätigt):
+  - `int86`/INT 16h → Taste nie konsumiert, Puffer voll, „Eingabe tot + Beep".
+  - `intdos`/INT 21h AH=02h (Echo) → falsches Zeichen bei DOS (0xDB-Block).
+  - `intdosx`/INT 21h FindFirst (Scan) → findet nichts, TAB beept nur.
+  Stattdessen für JEDEN residenten DOS/BIOS-Aufruf: **direkter `INT`-Opcode
+  per `#pragma aux`** (z.B. `int 0x16`/`int 0x10`/`int 0x21`). DOS-Carry per
+  `sbb ax,ax` zurückholen; Far-Pointer in DX:AX. `intdosx` ist NUR im
+  Init-Code von `main()` (vor `_dos_keep`, Hook noch nicht aktiv) ok.
+  Per `wdis` verifizieren, dass im Resident nur literale `int`-Opcodes stehen.
 - **DTA:** vor `FindFirst` eigene DTA setzen, danach COMMAND.COMs DTA
   restaurieren.
 - **new21:** Funktion 0Ah selbst behandeln (`return` ⇒ IRET, nicht chainen),
