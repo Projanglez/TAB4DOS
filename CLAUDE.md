@@ -12,6 +12,13 @@ eigenen Editor mit TAB-Completion (4DOS-artiges Zykeln durch Treffer).
 
 - Compiler: **Open Watcom 16-bit, Real Mode** — NICHT `wcl386`. Ein TSR
   läuft im Real Mode.
+- **`-s` ist ZWINGEND** (in `build.bat` gesetzt): schaltet die
+  Stack-Overflow-Checks (`__STK`-Aufruf an jedem Funktionseingang) ab. Der
+  residente Code läuft auf COMMAND.COMs/DOS' Stack; `__STK` vergleicht SP mit
+  *unseren* Runtime-Stack-Grenzen, meldet dort fälschlich Overflow und hängt
+  den Rechner auf. War die Ursache mehrerer „Eingabe tot + Beep"-Hänger
+  (v0.1–v0.3). Prüfen mit `wdis -a tabtsr.obj` → es darf KEIN `call __STK`
+  im residenten Code stehen.
 - Open Watcom liegt unter `C:\WATCOM`, Binaries in `binnt64\`. `build.bat`
   ruft `%WATCOM%\owsetenv.bat` auf und setzt den PATH automatisch.
 - Bauen: aus CMD `build.bat` aufrufen (nicht per Doppelklick im Explorer —
@@ -41,11 +48,14 @@ eigenen Editor mit TAB-Completion (4DOS-artiges Zykeln durch Treffer).
 
 ## Bekannte Risikostellen
 
-1. `_dos_keep`-Paragraphenrechnung in `main()` — bei Instabilität zuerst
+1. **Stack-Checks (`__STK`)** — bei jedem „Eingabe tot/Hänger" ZUERST prüfen,
+   ob `-s` aktiv ist und kein `__STK` im residenten Code steht (siehe Build).
+2. `_dos_keep`-Paragraphenrechnung in `main()` — bei Instabilität als Nächstes
    hier prüfen.
-2. `INTPACK`-Member (`r.w.ds` / `r.w.dx`) und `_chain_intr` —
-   versionsabhängig in Open Watcom.
-3. ENTER gibt CR+LF aus (bei Doppel-Leerzeile das `0x0A` entfernen).
+3. `INTPACK`-Member (`r.w.ds` / `r.w.dx`) und `_chain_intr` —
+   versionsabhängig in Open Watcom. (DS wird im `__interrupt`-Prolog korrekt
+   auf DGROUP gesetzt — per `wdis` verifiziert.)
+4. ENTER gibt CR+LF aus (bei Doppel-Leerzeile das `0x0A` entfernen).
 
 ## v0.1-Grenzen & Roadmap
 
