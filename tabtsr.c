@@ -26,7 +26,7 @@
 #include <dos.h>
 #include <i86.h>
 
-#define TABTSR_VERSION "0.3.2"        /* bei jedem Build letzte Stelle +1   */
+#define TABTSR_VERSION "0.3.3"        /* bei jedem Build letzte Stelle +1   */
 #define DEBUG_SCAN     1              /* 1 = file_count oben rechts anzeigen */
 
 extern unsigned _psp;
@@ -223,6 +223,16 @@ static void do_complete( unsigned bseg, unsigned boff, int *plen )
         comp_index = 0;
         shown_len  = comp_base_len;   /* der getippte Stem ist gerade sichtbar */
     }
+
+#if DEBUG_SCAN
+    /* Zeile 2: "BL=NN xy L=MM" -> comp_base_len, comp_base[0..1], len */
+    poke_ch(140,'B'); poke_ch(141,'L'); poke_ch(142,'=');
+    poke_hex(143,(unsigned char)comp_base_len);
+    poke_ch(146, (char)(comp_base_len > 0 ? comp_base[0] : '-'));
+    poke_ch(147, (char)(comp_base_len > 1 ? comp_base[1] : '-'));
+    poke_ch(149,'L'); poke_ch(150,'=');
+    poke_hex(151,(unsigned char)len);
+#endif
 
     /* Treffer Nr. comp_index suchen (Praefix comp_base, case-insensitiv) */
     target = comp_index; matched = -1; count = 0;
