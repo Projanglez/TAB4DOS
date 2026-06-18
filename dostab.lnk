@@ -1,0 +1,5 @@
+system dos
+name dostab.exe
+option quiet, map=dostab.map, stack=512
+order clname CODE clname FAR_DATA clname BEGDATA clname DATA clname BSS clname STACK clname INIT_CODE
+file dostab.obj

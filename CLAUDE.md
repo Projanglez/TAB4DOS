@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-# TABTSR — DOS-TSR für TAB-Dateinamen-Completion
+# DOSTAB — DOS-TSR für TAB-Dateinamen-Completion
 
 Resident-Programm (TSR) für **MS-DOS 6.22 auf echtem 386**. Hookt
 `INT 21h / AH=0Ah` und ersetzt COMMAND.COMs Zeileneingabe durch einen
@@ -17,19 +17,20 @@ eigenen Editor mit TAB-Completion (4DOS-artiges Zykeln durch Treffer).
   residente Code läuft auf COMMAND.COMs/DOS' Stack; `__STK` vergleicht SP mit
   *unseren* Runtime-Stack-Grenzen, meldet dort fälschlich Overflow und hängt
   den Rechner auf. War die Ursache mehrerer „Eingabe tot + Beep"-Hänger
-  (v0.1–v0.3). Prüfen mit `wdis -a tabtsr.obj` → es darf KEIN `call __STK`
+  (v0.1–v0.3). Prüfen mit `wdis -a dostab.obj` → es darf KEIN `call __STK`
   im residenten Code stehen.
 - Open Watcom liegt unter `C:\WATCOM`, Binaries in `binnt64\`. `build.bat`
   ruft `%WATCOM%\owsetenv.bat` auf und setzt den PATH automatisch.
 - Bauen: aus CMD `build.bat` aufrufen (nicht per Doppelklick im Explorer —
-  dann fehlt das Argument). Ausgabe: `tabtsr.exe`.
-- Test in DOSBox: `build.bat test` — startet `C:\dosgames\DOSBox.exe`,
-  mounted das Projektverzeichnis als `C:`, lädt `tabtsr`, wartet mit `pause`.
+  dann fehlt das Argument). Ausgabe: `dostab.exe`.
+- **KEIN DOSBox-Test.** DOSBox hat eine eigene TAB-Completion, die die unsere
+  überlagert — die Ergebnisse sind dort nicht aussagekräftig. Der Anwender
+  testet **ausschließlich direkt auf echter 386-Hardware**.
 - **Compile-Loop ist closed-loop** über Claude Code: Agent baut via
   `build.bat`, liest `wcl`-Fehler, fixt, baut neu.
-- **Laufzeit-/Verhaltenstest ist IMMER manuell**: erst DOSBox (`build.bat test`),
-  dann echter 386. Nie ungetestet auf Hardware —
-  ein fehlerhafter INT-21h-Hook kann den Rechner hängen lassen.
+- **Laufzeit-/Verhaltenstest ist IMMER manuell auf echtem 386** (durch den
+  Anwender). Nie ungetestet als „fertig" melden — ein fehlerhafter
+  INT-21h-Hook kann den Rechner hängen lassen.
 
 ## Architektur-Kern (Invarianten, nicht kaputt machen)
 
@@ -79,19 +80,29 @@ eigenen Editor mit TAB-Completion (4DOS-artiges Zykeln durch Treffer).
    versionsabhängig in Open Watcom. (DS wird im `__interrupt`-Prolog korrekt
    auf DGROUP gesetzt — per `wdis` verifiziert.)
 4. ENTER gibt CR+LF aus (bei Doppel-Leerzeile das `0x0A` entfernen).
-
-## v0.1-Grenzen & Roadmap
-
-Aktuell: append-only Eingabe (keine Cursor-Tasten), nur Basename im
-aktuellen Verzeichnis, kein Pfad-/PATH-Completion, 8.3 only.
-
-Nächste Stufen (nach Aufwand):
-1. **Pfad-Completion** — Verzeichnis vor dem letzten `\` als Suchpfad nutzen.
-2. **Doppel-TAB = Trefferliste** anzeigen statt zykeln.
-3. **Mid-Line-Editing** mit Cursor-Tasten (größter Umbau der Editor-Logik).
+5. **Environment-Block beim INSTALL freigeben, NICHT beim Uninstall** (v0.8).
+   Nach `scan_path_env()` (PATH gelesen) den eigenen Env-Block freigeben
+   (`AH=49h` auf PSP:0x2C) und `PSP:0x2C = 0` setzen — im normalen Prozess-
+   kontext, daher sicher. Spart ~Env-Größe resident. `do_uninstall` gibt dann
+   NUR den Programmblock (`psp_seg`) frei. Sackgassen, die das verursachten:
+   den Env-Block IM Uninstall freizugeben hing den Rechner; ihn liegenzulassen
+   erzeugte einen verwaisten MCB-Block, der den ZWEITEN install/uninstall-
+   Zyklus zum Hängen brachte (Beep pro Taste = toter 0Ah-Hook).
+6. **`#pragma aux` modify-Listen bei INT 21h/10h/16h** — MÜSSEN den vollen
+   flüchtigen Satz `[bx cx dx si di es]` (plus benutzte) angeben. Der
+   DOS-Dispatch und gechainte Handler dürfen diese Register zerstören. Eine
+   zu enge Liste lässt den Compiler einen lebenden Wert über den `int`-Aufruf
+   in einem dieser Register halten → Korruption (latenter Bug in v0.8 behoben).
+7. **Transient-Code-Split (INIT_TEXT/INIT_CODE):** Init/Uninstall-Funktionen
+   liegen via `#pragma code_seg` in `INIT_TEXT`, per `dostab.lnk` ORDER über
+   den Stack gelegt und durch `_dos_keep` freigegeben. Keep-Größe NICHT aus
+   einem Code-Offset rechnen (INIT_TEXT bekommt einen eigenen Frame, Offset
+   wird 0!) — die bewährte `(get_ss()-_psp)+(get_sp()/16)+16`-Formel nutzen.
+   Resident darf NIE eine INIT_TEXT-Funktion aufrufen (per `wdis` prüfen).
 
 ## Arbeitsweise
 
 - Vor jedem neuen Feature `/plan`, danach in **kleinen, testbaren
   Inkrementen** arbeiten und nach jedem Schritt einchecken.
-- Nach jedem grünen Build: manueller DOSBox-X-Smoke-Test, dann erst weiter.
+- Nach jedem grünen Build + `wdis`-Prüfung: der Anwender macht den
+  Smoke-Test auf echtem 386, dann erst weiter. (Kein DOSBox.)
