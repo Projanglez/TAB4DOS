@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-# DOSTAB — DOS TSR for TAB filename completion
+# TAB4DOS — DOS TSR for TAB filename completion
 
 Resident program (TSR) for **MS-DOS 6.22 on a real 386**. Hooks
 `INT 21h / AH=0Ah` and replaces COMMAND.COM's line input with its own
@@ -17,12 +17,12 @@ editor providing TAB completion (4DOS-style cycling through matches).
   resident code runs on COMMAND.COM's/DOS' stack; `__STK` compares SP against
   *our* runtime stack limits, falsely reports an overflow there and hangs
   the machine. This was the cause of several "input dead + beep" hangs
-  (v0.1–v0.3). Check with `wdis -a dostab.obj` → there must be NO `call __STK`
+  (v0.1–v0.3). Check with `wdis -a tab4dos.obj` → there must be NO `call __STK`
   in the resident code.
 - Open Watcom lives under `C:\WATCOM`, binaries in `binnt64\`. `build.bat`
   calls `%WATCOM%\owsetenv.bat` and sets the PATH automatically.
 - Build: invoke `build.bat` from CMD (not by double-clicking in Explorer —
-  then the argument is missing). Output: `dostab.exe`.
+  then the argument is missing). Output: `tab4dos.exe`.
 - **NO DOSBox testing.** DOSBox has its own TAB completion that overlays
   ours — the results there are not meaningful. The user
   tests **exclusively on real 386 hardware**.
@@ -112,7 +112,7 @@ editor providing TAB completion (4DOS-style cycling through matches).
    with a full config.
 7. **Transient code split (INIT_TEXT/INIT_CODE):** init/uninstall functions
    live via `#pragma code_seg` in `INIT_TEXT`, placed above the stack via
-   `dostab.lnk` ORDER and freed by `_dos_keep`. Do NOT compute the keep size
+   `tab4dos.lnk` ORDER and freed by `_dos_keep`. Do NOT compute the keep size
    from a code offset (INIT_TEXT gets its own frame, the offset becomes 0!) —
    use the proven `(get_ss()-_psp)+(get_sp()/16)+16` formula.
    The resident must NEVER call an INIT_TEXT function (check via `wdis`).

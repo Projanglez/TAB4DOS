@@ -1,6 +1,6 @@
 /*
- * DOSTAB - TAB filename completion for MS-DOS
- * v0.8  -  Open Watcom C (16-bit, Real Mode)
+ * TAB4DOS - TAB filename completion for MS-DOS
+ * Open Watcom C (16-bit, real mode). Version: see TAB4DOS_VERSION below.
  *
  * Architecture: standalone line editor, hooks INT 21h / AH=0Ah only.
  * Keys read via INT 16h (as normal caller, no hook). InDOS==0 guaranteed on entry.
@@ -10,13 +10,13 @@
  * command history (Up/Down), mid-line editing (Left/Right, Home, End, Del, Ins,
  * Ctrl+Left/Right), ESC to clear line, /u uninstall.
  *
- * Build: build.bat   Test: DOSBox (load check only), then real 386.
+ * Build: build.bat   Test: real DOS hardware (DOSBox masks our TAB completion).
  */
 
 #include <dos.h>
 #include <i86.h>
 
-#define DOSTAB_VERSION "0.10.0"
+#define TAB4DOS_VERSION "0.10.0"
 
 extern unsigned _psp;
 
@@ -32,7 +32,7 @@ static void (__interrupt __far *old21)();
 static unsigned char far *indos_ptr = 0;
 
 /* -------- Signature for /u detection ------------------------------------ */
-static const char sig[] = "DOSTAB-RES-1";
+static const char sig[] = "TAB4DOS-RES-1";
 static unsigned my_psp_seg = 0;
 
 /* -------- File name cache ----------------------------------------------- */
@@ -886,7 +886,7 @@ static int do_uninstall( void )
     cur = dos_getvect21();
     my_off = FP_OFF( (void far *)new21 );
     if ( FP_OFF( cur ) != my_off ) {
-        msg( "Error: DOSTAB is not the topmost INT 21h hook.\r\n" );
+        msg( "Error: TAB4DOS is not the topmost INT 21h hook.\r\n" );
         return 1;
     }
 
@@ -913,7 +913,7 @@ static int do_uninstall( void )
 
     /* Confirm before touching the vector/memory, so the message is emitted
        while the machine is in a fully normal state. */
-    msg( "DOSTAB uninstalled.\r\n" );
+    msg( "TAB4DOS uninstalled.\r\n" );
 
     dos_setvect21( old_vec );
 
@@ -929,7 +929,7 @@ static int do_uninstall( void )
     return 0;   /* unreachable; dos_exit never returns */
 }
 
-/* -------- Check whether DOSTAB is already resident ---------------------- */
+/* -------- Check whether TAB4DOS is already resident ---------------------- */
 static int already_loaded( void )
 {
     void far *cur; unsigned my_off, delta, res_seg, sig_off;
@@ -1076,7 +1076,7 @@ static int env_is( char far *e, const char *name )
 
 /* -------- Init: build idx_path + hist_path from %TEMP% (or %TMP%) ------- */
 /* Must run before the environment block is freed. idx_path = "<tempdir>\
-   DOSTAB.IDX"; falls back to "C:\DOSTAB.IDX". hist_path is the same path with
+   TAB4DOS.IDX"; falls back to "C:\TAB4DOS.IDX". hist_path is the same path with
    the extension changed to .HST. */
 static void build_paths( void )
 {
@@ -1104,7 +1104,7 @@ static void build_paths( void )
     }
 
     if ( prio == 0 ) {
-        static const char fb[] = "C:\\DOSTAB.IDX";
+        static const char fb[] = "C:\\TAB4DOS.IDX";
         for ( i = 0; fb[i]; i++ ) idx_path[i] = fb[i];
         idx_path[i] = 0;
     } else {
@@ -1112,7 +1112,7 @@ static void build_paths( void )
         if ( i > 0 && idx_path[i-1] != '\\' && idx_path[i-1] != '/' )
             idx_path[i++] = '\\';
         {
-            static const char fn[] = "DOSTAB.IDX";
+            static const char fn[] = "TAB4DOS.IDX";
             int k;
             for ( k = 0; fn[k]; k++ ) idx_path[i++] = fn[k];
             idx_path[i] = 0;
@@ -1147,10 +1147,10 @@ int main( void )
     }
 
     if ( do_help ) {
-        msg( "DOSTAB v" DOSTAB_VERSION " - Tab-Completion for MS-DOS\r\n" );
-        msg( "(c) 2026 Projanglez - www.github.com/projanglez/dostab\r\n" );
+        msg( "TAB4DOS v" TAB4DOS_VERSION " - Tab-Completion for MS-DOS\r\n" );
+        msg( "(c) 2026 Projanglez - www.github.com/projanglez/tab4dos\r\n" );
         msg( "\r\n" );
-        msg( "Usage: DOSTAB [/s] [/u] [/h]\r\n" );
+        msg( "Usage: TAB4DOS [/s] [/u] [/h]\r\n" );
         msg( "\r\n" );
         msg( "  /s   Silent mode (suppress all output)\r\n" );
         msg( "  /u   Uninstall TSR from memory\r\n" );
@@ -1172,8 +1172,8 @@ int main( void )
     }
 
     if ( !silent ) {
-        msg( "DOSTAB v" DOSTAB_VERSION " - Tab-Completion for MS-DOS\r\n" );
-        msg( "(c) 2026 Projanglez - www.github.com/projanglez/dostab\r\n" );
+        msg( "TAB4DOS v" TAB4DOS_VERSION " - Tab-Completion for MS-DOS\r\n" );
+        msg( "(c) 2026 Projanglez - www.github.com/projanglez/tab4dos\r\n" );
         msg( "\r\n" );
     }
 
@@ -1230,7 +1230,7 @@ int main( void )
     if ( !silent ) msg( "TSR successfully loaded\r\n\r\n" );
 
     /* Keep PSP + code + DGROUP + stack. INIT_TEXT is linked ABOVE the stack
-       (see dostab.lnk), so it lies past SS:SP and is freed by this. Computed
+       (see tab4dos.lnk), so it lies past SS:SP and is freed by this. Computed
        from SS:SP (not a code offset) so it is independent of how the linker
        frames the INIT_TEXT segment. */
     para = (get_ss() - _psp) + (get_sp() / 16) + 16;
