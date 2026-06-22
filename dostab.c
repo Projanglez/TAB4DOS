@@ -16,7 +16,7 @@
 #include <dos.h>
 #include <i86.h>
 
-#define DOSTAB_VERSION "0.8.0"
+#define DOSTAB_VERSION "0.9.0"
 
 extern unsigned _psp;
 
@@ -47,9 +47,14 @@ static int           file_count;
 static unsigned char dta_buf[64];
 
 /* -------- Command name cache (DOS internals + PATH executables) ---------- */
+/* Built once at install, then written to a file in %TEMP% and read on demand
+   during completion (SmartDrive keeps it RAM-fast). Keeping it out of resident
+   BSS saves CMD_MAX*NAME_LEN bytes. The build-time staging buffer aliases the
+   resident hist_buf (empty at install), so staging costs no extra memory. */
 #define CMD_MAX 128
-static char cmd_cache[CMD_MAX][NAME_LEN];
-static int  cmd_count = 0;
+static int  cmd_count = 0;                 /* number of records in idx_path   */
+static char idx_path[80];                  /* full path to the index file     */
+static char cmd_name[NAME_LEN];            /* record read buffer / matched name */
 
 /* -------- Completion state ----------------------------------------------- */
 #define COMP_FILE 0
@@ -57,7 +62,7 @@ static int  cmd_count = 0;
 static char comp_base[NAME_LEN];
 static int  comp_base_len  = 0;
 static int  comp_active    = 0;
-static int  comp_index     = 0;
+static int  comp_cur       = -1;   /* index of currently shown match, -1=none */
 static int  shown_len      = 0;
 static int  comp_mode      = COMP_FILE;
 static int  comp_first_word = 0;
@@ -109,19 +114,28 @@ static int strcmp_ci( const char *a, const char *b )
 }
 
 /* -------- Console output via BIOS INT 10h/0Eh --------------------------- */
+/* Full volatile modify list (CLAUDE.md #6): a TSR that hooks INT 10h (e.g. a
+   mouse driver hiding/showing its cursor) may clobber the whole volatile set,
+   not just the AH/BX this teletype call itself uses. A narrow list lets the
+   compiler park a live value (e.g. old_vec's offset) in DX/SI/... across a
+   con_out/msg call -> corruption only under a full config (hooked INT 10h),
+   silently fine on a bare boot. */
 void con_out( char c );
 #pragma aux con_out =   \
     "mov ah,0x0E"       \
     "mov bx,0x0007"     \
     "int 0x10"          \
     parm [al]           \
-    modify [ah bx];
+    modify [ah bx cx dx si di es];
 
 static void msg( char *s ) { while ( *s ) con_out( *s++ ); }
 
 /* -------- Key read via INT 16h/00h (direct opcode, no int86) ------------ */
+/* Full volatile modify list (CLAUDE.md #6): KEYB and other TSRs hook INT 16h
+   and may clobber the volatile set; without this the compiler could keep a
+   live value across a key read and lose it only under a full config. */
 unsigned get_key( void );
-#pragma aux get_key = "mov ah,0" "int 0x16" value [ax];
+#pragma aux get_key = "mov ah,0" "int 0x16" value [ax] modify [bx cx dx si di es];
 
 /* -------- Direct INT 21h helpers ---------------------------------------- */
 void far *dos_get_dta( void );
@@ -162,6 +176,74 @@ unsigned dos_findnext( void );
     "mov ah,0x4F"           \
     "int 0x21"              \
     "sbb ax,ax"             \
+    value  [ax]             \
+    modify [bx cx dx si di es];
+
+/* -------- Direct INT 21h file I/O (open/read/close + create/write) -------- */
+/* InDOS==0 in the 0Ah hook, so these are safe in resident code. Direct int
+   opcode only (no intdos/int86). Full volatile modify list per CLAUDE.md #6.
+   All paths/buffers are DGROUP globals and DS==DGROUP at every call site (the
+   __interrupt prolog sets DS in the hook; normal context in init), so we pass a
+   NEAR offset and use the live DS as segment. This deliberately avoids a far
+   pointer in a custom register pair: Watcom assigns the seg/off halves to the
+   two registers by its own rule, not the order listed, which silently put the
+   offset where the body expected the segment (DS <- offset -> reads failed,
+   /u hung). A single near register sidesteps that entirely. */
+
+/* Open existing file read-only (AH=3Dh, AL=0). Returns handle, 0xFFFF on CF. */
+unsigned dos_open( const char *path );
+#pragma aux dos_open =      \
+    "mov ax,0x3D00"         \
+    "int 0x21"              \
+    "jnc o_ok"              \
+    "mov ax,0xFFFF"         \
+    "o_ok:"                 \
+    parm   [dx]             \
+    value  [ax]             \
+    modify [bx cx dx si di es];
+
+/* Read up to n bytes (AH=3Fh) into buf. Returns bytes read, 0xFFFF on CF. */
+unsigned dos_read( unsigned handle, char *buf, unsigned n );
+#pragma aux dos_read =      \
+    "mov ah,0x3F"           \
+    "int 0x21"              \
+    "jnc r_ok"              \
+    "mov ax,0xFFFF"         \
+    "r_ok:"                 \
+    parm   [bx] [dx] [cx]   \
+    value  [ax]             \
+    modify [bx cx dx si di es];
+
+/* Close a handle (AH=3Eh). */
+void dos_close( unsigned handle );
+#pragma aux dos_close =     \
+    "mov ah,0x3E"           \
+    "int 0x21"              \
+    parm   [bx]             \
+    modify [ax bx cx dx si di es];
+
+/* Create/truncate file (AH=3Ch, normal attr). Returns handle, 0xFFFF on CF. */
+unsigned dos_create( const char *path );
+#pragma aux dos_create =    \
+    "xor cx,cx"             \
+    "mov ah,0x3C"           \
+    "int 0x21"              \
+    "jnc c_ok"              \
+    "mov ax,0xFFFF"         \
+    "c_ok:"                 \
+    parm   [dx]             \
+    value  [ax]             \
+    modify [bx cx dx si di es];
+
+/* Write n bytes from buf (AH=40h). Returns bytes written, 0xFFFF on CF. */
+unsigned dos_write( unsigned handle, char *buf, unsigned n );
+#pragma aux dos_write =     \
+    "mov ah,0x40"           \
+    "int 0x21"              \
+    "jnc w_ok"              \
+    "mov ax,0xFFFF"         \
+    "w_ok:"                 \
+    parm   [bx] [dx] [cx]   \
     value  [ax]             \
     modify [bx cx dx si di es];
 
@@ -220,6 +302,16 @@ void tsr_keep( unsigned para );
     "int 0x21"              \
     parm   [dx]             \
     modify [ax bx cx si di es];
+
+/* Terminate process directly (AH=4Ch, AL=0). Never returns. Used by /u to end
+   the uninstaller WITHOUT the Watcom C-runtime exit path (FiniRtns/atexit/
+   null-check), which hangs under a full config after a successful unhook+free
+   (set-vector and free both verified to complete; only the C exit hung). */
+void dos_exit( void );
+#pragma aux dos_exit =      \
+    "mov ax,0x4C00"         \
+    "int 0x21"              \
+    aborts;
 
 /* -------- Directory scan ------------------------------------------------- */
 static void scan_directory_path( void far *pat )
@@ -320,8 +412,85 @@ static void cursor_left_n( int n )
     while ( n-- > 0 ) con_out( 0x08 );
 }
 
+/* -------- Command lookup from the index file ----------------------------- */
+/* Find the target-th (0-based) command in idx_path whose name matches
+   comp_base[0..comp_base_len). On success copies the name into cmd_name and
+   returns 1; on no-match or any I/O error returns 0 (caller beeps, never hangs).
+   Re-reads the file from the start each call; SmartDrive keeps it RAM-fast. */
+static int cmd_find( int target )
+{
+    unsigned h, got;
+    int i, count;
+
+    h = dos_open( idx_path );
+    if ( h == 0xFFFF ) return 0;
+
+    /* Read each record straight into cmd_name; on the target-th match it is
+       already in place, so just close and return. cmd_name is only consulted
+       by the caller after a successful (return 1) find. */
+    count = 0;
+    for ( i = 0; i < cmd_count; i++ ) {
+        got = dos_read( h, cmd_name, NAME_LEN );
+        if ( got != NAME_LEN ) break;          /* short read / EOF / error */
+        if ( comp_base_len == 0 ||
+             ( strlen_local(cmd_name) >= comp_base_len &&
+               memcmp_local(cmd_name, comp_base, comp_base_len) == 0 ) ) {
+            if ( count == target ) { dos_close( h ); return 1; }
+            count++;
+        }
+    }
+    dos_close( h );
+    return 0;
+}
+
+/* True if cache entry e matches the typed stem comp_base[0..comp_base_len). */
+static int comp_matches( const char *e )
+{
+    return comp_base_len == 0 ||
+           ( strlen_local(e) >= comp_base_len &&
+             memcmp_local(e, comp_base, comp_base_len) == 0 );
+}
+
+/* Count matching command records in idx_path (0 on any I/O error). */
+static int cmd_count_matches( void )
+{
+    unsigned h, got;
+    int i, n = 0;
+    h = dos_open( idx_path );
+    if ( h == 0xFFFF ) return 0;
+    for ( i = 0; i < cmd_count; i++ ) {
+        got = dos_read( h, cmd_name, NAME_LEN );
+        if ( got != NAME_LEN ) break;
+        if ( comp_matches( cmd_name ) ) n++;
+    }
+    dos_close( h );
+    return n;
+}
+
+/* Count matching file_cache entries. */
+static int file_count_matches( void )
+{
+    int i, n = 0;
+    for ( i = 0; i < file_count; i++ )
+        if ( comp_matches( file_cache[i] ) ) n++;
+    return n;
+}
+
+/* Return file_cache index of the target-th match, or -1. */
+static int file_nth_match( int target )
+{
+    int i, c = 0;
+    for ( i = 0; i < file_count; i++ )
+        if ( comp_matches( file_cache[i] ) ) {
+            if ( c == target ) return i;
+            c++;
+        }
+    return -1;
+}
+
 /* -------- TAB completion ------------------------------------------------- */
-static int do_complete( unsigned bseg, unsigned boff, int len )
+/* dir = +1 (TAB, forward) or -1 (Shift+TAB, backward). */
+static int do_complete( unsigned bseg, unsigned boff, int len, int dir )
 {
     char far *buf = (char far *)MK_FP( bseg, boff );
     int maxlen = (unsigned char)buf[0];
@@ -369,53 +538,38 @@ static int do_complete( unsigned bseg, unsigned boff, int len )
 
         comp_mode       = COMP_FILE;   /* always try files first */
         comp_first_word = first_word;  /* remember for cmd fallback */
-        comp_index = 0;
+        comp_cur   = -1;               /* nothing shown yet */
         shown_len  = dir_prefix_len + comp_base_len;
     }
 
-    /* Search for match at comp_index */
-    target = comp_index; matched = -1; count = 0;
-    {
-        int csz = (comp_mode == COMP_CMD) ? cmd_count : file_count;
-        for ( i = 0; i < csz; i++ ) {
-            const char *e = (comp_mode == COMP_CMD) ? cmd_cache[i] : file_cache[i];
-            if ( comp_base_len == 0 ||
-                 ( strlen_local(e) >= comp_base_len &&
-                   memcmp_local(e, comp_base, comp_base_len) == 0 ) ) {
-                if ( count == target ) { matched = i; break; }
-                count++;
-            }
-        }
-        if ( matched < 0 && target > 0 ) {
-            /* wrap around within current cache */
-            comp_index = 0;
-            for ( i = 0; i < csz; i++ ) {
-                const char *e = (comp_mode == COMP_CMD) ? cmd_cache[i] : file_cache[i];
-                if ( comp_base_len == 0 ||
-                     ( strlen_local(e) >= comp_base_len &&
-                       memcmp_local(e, comp_base, comp_base_len) == 0 ) ) {
-                    matched = i; break;
-                }
-            }
-        }
-    }
-    /* No file match: fall back to cmd_cache (first word only, at least 1 char typed) */
-    if ( matched < 0 && comp_mode == COMP_FILE &&
+    /* Count matches in the current mode. If file mode has none and we may fall
+       back to commands (first word, >=1 char typed), switch to command mode. */
+    count = (comp_mode == COMP_CMD) ? cmd_count_matches() : file_count_matches();
+    if ( count == 0 && comp_mode == COMP_FILE &&
          comp_first_word && comp_base_len > 0 ) {
-        comp_mode  = COMP_CMD;
-        comp_index = 0;
-        for ( i = 0; i < cmd_count; i++ ) {
-            if ( strlen_local(cmd_cache[i]) >= comp_base_len &&
-                 memcmp_local(cmd_cache[i], comp_base, comp_base_len) == 0 ) {
-                matched = i; break;
-            }
-        }
+        comp_mode = COMP_CMD;
+        comp_cur  = -1;
+        count     = cmd_count_matches();
     }
-    if ( matched < 0 ) { con_out(0x07); comp_active = 0; return len; }
+    if ( count == 0 ) { con_out(0x07); comp_active = 0; return len; }
 
-    {
-        const char *e = (comp_mode == COMP_CMD) ? cmd_cache[matched] : file_cache[matched];
-        namelen = strlen_local( e );
+    /* Pick the next match index in the requested direction, wrapping. From a
+       fresh start (comp_cur < 0) forward shows the first, backward the last. */
+    if ( comp_cur < 0 )
+        target = ( dir > 0 ) ? 0 : count - 1;
+    else
+        target = ( comp_cur + dir + count ) % count;
+
+    /* Resolve the chosen match. Commands land in cmd_name; files give an index
+       into file_cache. matched is unused (0) in command mode. */
+    matched = 0;
+    if ( comp_mode == COMP_CMD ) {
+        if ( !cmd_find( target ) ) { con_out(0x07); comp_active = 0; return len; }
+        namelen = strlen_local( cmd_name );
+    } else {
+        matched = file_nth_match( target );
+        if ( matched < 0 ) { con_out(0x07); comp_active = 0; return len; }
+        namelen = strlen_local( file_cache[matched] );
     }
 
     if ( comp_mode == COMP_CMD ) {
@@ -440,26 +594,19 @@ static int do_complete( unsigned bseg, unsigned boff, int len )
 
     /* Write matched name */
     {
-        const char *e = (comp_mode == COMP_CMD) ? cmd_cache[matched] : file_cache[matched];
+        const char *e = (comp_mode == COMP_CMD) ? cmd_name : file_cache[matched];
         for ( i = 0; i < namelen; i++ )
             { buf[2+len] = e[i]; con_out(e[i]); len++; }
     }
 
     if ( comp_mode == COMP_CMD ) {
         buf[2+len] = ' '; con_out(' '); len++;
-        shown_len  = dir_prefix_len + addlen;
-        comp_active = 1;
-        comp_index++;
     } else if ( file_is_dir[matched] ) {
-        buf[2+len] = '\\'; con_out('\\'); len++;
-        shown_len   = dir_prefix_len + addlen;
-        comp_active = 1;   /* next TAB cycles within same dir, not descends */
-        comp_index++;
-    } else {
-        shown_len   = dir_prefix_len + addlen;
-        comp_active = 1;
-        comp_index++;
+        buf[2+len] = '\\'; con_out('\\'); len++;  /* cycles within dir, not descends */
     }
+    shown_len   = dir_prefix_len + addlen;
+    comp_active = 1;
+    comp_cur    = target;
 
     return len;
 }
@@ -475,7 +622,7 @@ static void do_readline( unsigned bseg, unsigned boff )
     unsigned k; unsigned char ascii, scan;
     int i;
 
-    comp_active = 0; comp_base_len = 0; shown_len = 0; comp_index = 0;
+    comp_active = 0; comp_base_len = 0; shown_len = 0; comp_cur = -1;
     hist_idx = -1;
 
     for ( ;; ) {
@@ -493,10 +640,10 @@ static void do_readline( unsigned bseg, unsigned boff )
             return;
         }
 
-        else if ( ascii == 0x09 ) {               /* TAB: only at end of line */
+        else if ( ascii == 0x09 ) {               /* TAB: forward, end of line */
             if ( cur < len ) { con_out(0x07); }
             else {
-                len = do_complete( bseg, boff, len );
+                len = do_complete( bseg, boff, len, +1 );
                 cur = len;
             }
         }
@@ -522,6 +669,16 @@ static void do_readline( unsigned bseg, unsigned boff )
         }
 
         else if ( ascii == 0x00 ) {               /* Extended key           */
+
+            if ( scan == 0x0F ) {                 /* Shift+TAB: backward    */
+                if ( cur < len ) { con_out(0x07); }
+                else {
+                    len = do_complete( bseg, boff, len, -1 );
+                    cur = len;
+                }
+                continue;                         /* keep comp_active for cycling */
+            }
+
             comp_active = 0;
 
             if ( scan == 0x48 ) {                 /* Up: history            */
@@ -646,8 +803,12 @@ void __interrupt __far new21( union INTPACK r )
 #pragma code_seg ( "INIT_TEXT", "INIT_CODE" )
 
 /* -------- Uninstall (/u) ------------------------------------------------- */
-/* Always prints its result. Silent mode (/s) is meaningful for startup but not
-   for a deliberate uninstall, so it is intentionally ignored here. */
+/* Proven v0.8 teardown: read the resident DGROUP via the (still-installed) hook
+   vector, verify our signature, then restore the saved INT 21h vector (AH=25h)
+   and free the resident program block (AH=49h). The %TEMP% index file is left
+   behind intentionally (harmless; a fresh install truncates it). Silent mode
+   (/s) is meaningful for startup but not for a deliberate uninstall, so it is
+   intentionally ignored here. */
 static int do_uninstall( void )
 {
     void far *cur;
@@ -699,7 +860,10 @@ static int do_uninstall( void )
        cycles. */
     dos_free_seg( psp_seg );
 
-    return 0;
+    /* Terminate directly (AH=4Ch). Skips the C-runtime exit, which hung here
+       under a full config even though the unhook+free above both completed. */
+    dos_exit();
+    return 0;   /* unreachable; dos_exit never returns */
 }
 
 /* -------- Check whether DOSTAB is already resident ---------------------- */
@@ -722,7 +886,17 @@ static int already_loaded( void )
     return 1;
 }
 
-/* -------- Init: load DOS internal commands into cmd_cache --------------- */
+/* -------- Init: command-list staging buffer ----------------------------- */
+/* The command list is built here, then written to idx_path and dropped from
+   resident memory. Staging aliases the resident hist_buf, which is empty at
+   install time (history is only filled at runtime). CMD_MAX*NAME_LEN bytes
+   (1664) fit inside sizeof hist_buf (2560), so this costs no extra memory. */
+static char *cmd_stage( int idx )
+{
+    return ( (char *)hist_buf ) + idx * NAME_LEN;
+}
+
+/* -------- Init: load DOS internal commands into staging ----------------- */
 static void load_dos_cmds( void )
 {
     static const char * const cmds[] = {
@@ -733,9 +907,10 @@ static void load_dos_cmds( void )
     };
     int i, j;
     for ( i = 0; cmds[i] && cmd_count < CMD_MAX; i++ ) {
+        char *slot = cmd_stage( cmd_count );
         for ( j = 0; cmds[i][j] && j < NAME_LEN-1; j++ )
-            cmd_cache[cmd_count][j] = cmds[i][j];
-        cmd_cache[cmd_count][j] = 0;
+            slot[j] = cmds[i][j];
+        slot[j] = 0;
         cmd_count++;
     }
 }
@@ -774,12 +949,14 @@ static void scan_one_path_dir( char far *dir, int dlen )
             /* Skip duplicates */
             dup = 0;
             for ( i = 0; i < cmd_count; i++ ) {
-                if ( strlen_local(cmd_cache[i]) == ni &&
-                     memcmp_local(cmd_cache[i], name, ni) == 0 )
+                char *ce = cmd_stage( i );
+                if ( strlen_local(ce) == ni &&
+                     memcmp_local(ce, name, ni) == 0 )
                     { dup = 1; break; }
             }
             if ( !dup ) {
-                for ( i = 0; i <= ni; i++ ) cmd_cache[cmd_count][i] = name[i];
+                char *slot = cmd_stage( cmd_count );
+                for ( i = 0; i <= ni; i++ ) slot[i] = name[i];
                 cmd_count++;
             }
 
@@ -815,6 +992,81 @@ static void scan_path_env( void )
         while ( *env ) env++;
         env++;
     }
+}
+
+/* -------- Init: does env entry e start with "<name>="? (case-insensitive) - */
+static int env_is( char far *e, const char *name )
+{
+    int i;
+    for ( i = 0; name[i]; i++ ) {
+        char c = e[i];
+        if ( c >= 'a' && c <= 'z' ) c -= 0x20;
+        if ( c != name[i] ) return 0;
+    }
+    return e[i] == '=';
+}
+
+/* -------- Init: build idx_path from %TEMP% (or %TMP%) ------------------- */
+/* Must run before the environment block is freed. idx_path = "<tempdir>\
+   DOSTAB.IDX"; falls back to "C:\DOSTAB.IDX" if neither variable is set. */
+static void build_idx_path( void )
+{
+    unsigned env_seg = *(unsigned far *)MK_FP( _psp, 0x2C );
+    char far *env    = (char far *)MK_FP( env_seg, 0 );
+    int tlen = 0, prio = 0;           /* 2 = TEMP found, 1 = TMP found */
+    int i;
+
+    /* Accumulate the chosen temp directory directly into idx_path; a later
+       higher-priority match (TEMP over TMP) simply overwrites from the start. */
+    while ( *env ) {
+        int take = 0;
+        if ( env_is( env, "TEMP" ) )          take = 2;
+        else if ( env_is( env, "TMP" ) )      take = 1;
+        if ( take > prio ) {
+            char far *v = env;
+            while ( *v && *v != '=' ) v++;
+            if ( *v == '=' ) v++;
+            tlen = 0;
+            while ( *v && tlen < 64 ) idx_path[tlen++] = *v++;
+            prio = take;
+        }
+        while ( *env ) env++;
+        env++;
+    }
+
+    if ( prio == 0 ) {
+        static const char fb[] = "C:\\DOSTAB.IDX";
+        for ( i = 0; fb[i]; i++ ) idx_path[i] = fb[i];
+        idx_path[i] = 0;
+        return;
+    }
+
+    i = tlen;
+    if ( i > 0 && idx_path[i-1] != '\\' && idx_path[i-1] != '/' )
+        idx_path[i++] = '\\';
+    {
+        static const char fn[] = "DOSTAB.IDX";
+        int k;
+        for ( k = 0; fn[k]; k++ ) idx_path[i++] = fn[k];
+        idx_path[i] = 0;
+    }
+}
+
+/* -------- Init: write the staged command list to idx_path --------------- */
+/* Returns 1 on success. On failure the caller disables command completion
+   (cmd_count = 0); file completion is unaffected. */
+static int write_idx_file( void )
+{
+    unsigned h, n;
+    h = dos_create( idx_path );
+    if ( h == 0xFFFF ) return 0;
+    n = (unsigned)cmd_count * NAME_LEN;
+    if ( n > 0 && dos_write( h, (char *)hist_buf, n ) != n ) {
+        dos_close( h );
+        return 0;
+    }
+    dos_close( h );
+    return 1;
 }
 
 /* -------- Install ------------------------------------------------------- */
@@ -874,14 +1126,26 @@ int main( void )
         return 1;
     }
 
-    /* Load DOS commands and PATH executables into cmd_cache */
+    /* Build the command list in staging (aliased to hist_buf) and resolve the
+       index-file path from %TEMP%/%TMP%. Both read the environment, so they
+       must run before the env block is freed below. */
     load_dos_cmds();
     scan_path_env();
+    build_idx_path();
 
-    /* Free our environment block now: PATH has been read and the resident copy
-       never needs the environment again. Done here in normal process context
-       (safe), which (a) frees ~the env block worth of resident memory and
-       (b) avoids leaving an orphaned env block that would break repeated
+    /* Persist the command list to idx_path, then drop it from resident memory.
+       On failure, disable command completion (file completion still works). */
+    if ( !write_idx_file() ) {
+        if ( !silent )
+            msg( "Warning: could not write command index; "
+                 "command completion disabled.\r\n" );
+        cmd_count = 0;
+    }
+
+    /* Free our environment block now: PATH/TEMP have been read and the resident
+       copy never needs the environment again. Done here in normal process
+       context (safe), which (a) frees ~the env block worth of resident memory
+       and (b) avoids leaving an orphaned env block that would break repeated
        install/uninstall cycles. Zero PSP:0x2C so nothing references it. */
     {
         unsigned far *env_field = (unsigned far *)MK_FP( _psp, 0x2C );

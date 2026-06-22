@@ -93,12 +93,38 @@ eigenen Editor mit TAB-Completion (4DOS-artiges Zykeln durch Treffer).
    DOS-Dispatch und gechainte Handler dürfen diese Register zerstören. Eine
    zu enge Liste lässt den Compiler einen lebenden Wert über den `int`-Aufruf
    in einem dieser Register halten → Korruption (latenter Bug in v0.8 behoben).
+   **Gilt AUCH für die residenten BIOS-Primitive `con_out` (INT 10h) und
+   `get_key` (INT 16h), nicht nur für die INT-21h-Helfer!** Bei VOLLER Config
+   hooken Maus-/Tastatur-/Display-TSRs (CTMOUSE, KEYB, DISPLAY/ANSI) diese
+   BIOS-Interrupts und zerstören Register, die das nackte BIOS bewahrt. Eine
+   enge Liste (`con_out` hatte nur `[ah bx]`, `get_key` gar keine) ist bei
+   F5-Boot zufällig korrekt, **hängt aber bei vollem Boot**: z.B. wurde `old_vec`
+   in `do_uninstall` über den `msg()`-Aufruf in DX gehalten, der gehookte INT 10h
+   zerstörte DX → falscher INT-21h-Vektor restauriert → Hänger. Voller Satz
+   `[ah bx cx dx si di es]` zwingt den Compiler, lebende Werte über den Aufruf
+   auf den Stack zu spillen (per `wdis` verifiziert: `msg_` `push dx … pop dx`).
+   Solche Bugs sind auf F5-Boot UNSICHTBAR — immer mit voller Config testen.
 7. **Transient-Code-Split (INIT_TEXT/INIT_CODE):** Init/Uninstall-Funktionen
    liegen via `#pragma code_seg` in `INIT_TEXT`, per `dostab.lnk` ORDER über
    den Stack gelegt und durch `_dos_keep` freigegeben. Keep-Größe NICHT aus
    einem Code-Offset rechnen (INIT_TEXT bekommt einen eigenen Frame, Offset
    wird 0!) — die bewährte `(get_ss()-_psp)+(get_sp()/16)+16`-Formel nutzen.
    Resident darf NIE eine INIT_TEXT-Funktion aufrufen (per `wdis` prüfen).
+8. **`/u` MUSS via direktem `INT 21h AH=4Ch` (`dos_exit()`) terminieren, NICHT
+   über den Watcom-C-Runtime-Exit.** Nach erfolgreichem Unhook (`AH=25h`) +
+   Free (`AH=49h`) — beide auf HW als OK verifiziert (Marker `1`/`2`/`3`) —
+   **hängt der C-Runtime-Exit** (FiniRtns/atexit/Null-Pointer-Check) bei VOLLER
+   Config (EMM386/UMB, DOS=HIGH, STACKS, geladene TSRs); bei F5 läuft er durch.
+   `do_uninstall` ruft daher am Ende `dos_exit()` und kehrt nie zur C-Runtime
+   zurück. Standard-TSR-Teardown: **Unhook → Free → AH=4Ch.** `return 0` danach
+   ist unerreichbar (nur für den Compiler).
+9. **Diagnose-Marker im `/u`-Teardown: NUR inline `con_out`, KEINE Helfer-
+   Funktion.** Ein Hex-Dump-Helfer (`con_hex16`) bekam vom `-os`-Optimierer
+   einen mit `do_uninstall` GETEILTEN Epilog (Cross-Function-Tail-Merge via
+   gemeinsames `L$xxx`); das verfälschte den Rücksprung und ließ `/u` mitten im
+   Dump sauber terminieren (statt zu hängen) → falsche Spur. Inline-`con_out`
+   (per `#pragma aux` ge-inlined, kein Call, kein geteilter Epilog) ist als
+   Marker zuverlässig.
 
 ## Arbeitsweise
 
