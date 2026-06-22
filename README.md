@@ -1,8 +1,8 @@
 # TAB4DOS
 
-A small resident utility (TSR) for MS-DOS that adds **4DOS-style TAB filename
-completion**, **command history**, and **command-line editing** to the standard
-`COMMAND.COM` prompt.
+A small resident utility (TSR) for MS-DOS that 
+adds **bash-style TAB completion**, **command history**, and **command-line editing** to the 
+standard `COMMAND.COM` prompt.
 
 It hooks `INT 21h / AH=0Ah` (buffered line input) and replaces COMMAND.COM's
 line editor with its own, while leaving everything else untouched.
@@ -12,10 +12,10 @@ line editor with its own, while leaving everything else untouched.
 - **TAB / Shift+TAB** — complete and cycle matches (forward / backward) for
   files, directories, path fragments, DOS internal commands, and executables
   found on `PATH`.
-- **Up / Down** — browse command history (64 entries).
+- **Up / Down** — browse command history (64 entries), replaces DOSKEY
 - **Line editing** — Left/Right, Home/End, Del, Ins (insert/overwrite),
   Ctrl+Left/Ctrl+Right (jump word), ESC (clear line).
-- **Small footprint** — ~8.5 KB resident. The command list and the history ring
+- **Small footprint** — ~9 KB resident. The command list and the history ring
   are kept in small files (`TAB4DOS.IDX` / `TAB4DOS.HST`) next to the EXE (or in
   `%TEMP%` with `/usetemp`), not in resident memory; with SmartDrive these
   reads/writes are effectively RAM-speed.
@@ -68,5 +68,6 @@ mode.
 - Test on **real DOS hardware** (or a faithful emulator). DOSBox ships its own
   built-in TAB completion that overrides this tool, so results there are not
   meaningful.
+- This software was developed with the help of an AI coding assistant (Claude Code).
 
 (c) 2026 Projanglez
