@@ -16,7 +16,7 @@
 #include <dos.h>
 #include <i86.h>
 
-#define DOSTAB_VERSION "0.9.0"
+#define DOSTAB_VERSION "0.10.0"
 
 extern unsigned _psp;
 
@@ -47,14 +47,16 @@ static int           file_count;
 static unsigned char dta_buf[64];
 
 /* -------- Command name cache (DOS internals + PATH executables) ---------- */
-/* Built once at install, then written to a file in %TEMP% and read on demand
-   during completion (SmartDrive keeps it RAM-fast). Keeping it out of resident
-   BSS saves CMD_MAX*NAME_LEN bytes. The build-time staging buffer aliases the
-   resident hist_buf (empty at install), so staging costs no extra memory. */
+/* Built once at install, written incrementally to a NAME_LEN-record file in
+   %TEMP% and read on demand during completion (SmartDrive keeps it RAM-fast).
+   Keeping it out of resident BSS saves CMD_MAX*NAME_LEN bytes; the file is
+   built record-by-record with disk-based dedup, so no resident staging buffer
+   is needed. */
 #define CMD_MAX 128
 static int  cmd_count = 0;                 /* number of records in idx_path   */
 static char idx_path[80];                  /* full path to the index file     */
 static char cmd_name[NAME_LEN];            /* record read buffer / matched name */
+static unsigned idx_h;                     /* install-only: idx file write handle */
 
 /* -------- Completion state ----------------------------------------------- */
 #define COMP_FILE 0
@@ -72,11 +74,14 @@ static char scan_pat[80];
 static char dir_prefix[68];
 static int  dir_prefix_len = 0;
 
-/* -------- History ring buffer ------------------------------------------- */
-#define HIST_COUNT  20
+/* -------- History ring buffer (slot contents live on disk, see hist_path) - */
+#define HIST_COUNT  64
 #define HIST_MAXLEN 128
-static char hist_buf[HIST_COUNT][HIST_MAXLEN];
-static int  hist_len_arr[HIST_COUNT];
+/* Each ring slot is a fixed HIST_MAXLEN-byte record in the history file:
+   rec[0] = length (1..127), rec[1..len] = chars. Slot N is at offset
+   N*HIST_MAXLEN. Only the ring indices stay resident. */
+static char hist_path[80];               /* full path to the history file     */
+static char hist_rec[HIST_MAXLEN];       /* one-slot read/write scratch        */
 static int  hist_head    = 0;
 static int  hist_total   = 0;
 static int  hist_idx     = -1;
@@ -247,6 +252,29 @@ unsigned dos_write( unsigned handle, char *buf, unsigned n );
     value  [ax]             \
     modify [bx cx dx si di es];
 
+/* Seek from start of file (AH=42h, AL=0). off < 64KB (CX=0). Used for the
+   fixed-record index dedup and the history slot ring. */
+void dos_lseek( unsigned handle, unsigned off );
+#pragma aux dos_lseek =     \
+    "mov ax,0x4200"         \
+    "xor cx,cx"             \
+    "int 0x21"              \
+    parm   [bx] [dx]        \
+    modify [ax bx cx dx si di es];
+
+/* Open existing file read/write (AH=3Dh, AL=2). Returns handle, 0xFFFF on CF.
+   Used by hist_save (read-dedup then write on one handle). */
+unsigned dos_open_rw( const char *path );
+#pragma aux dos_open_rw =   \
+    "mov ax,0x3D02"         \
+    "int 0x21"              \
+    "jnc orw_ok"            \
+    "mov ax,0xFFFF"         \
+    "orw_ok:"               \
+    parm   [dx]             \
+    value  [ax]             \
+    modify [bx cx dx si di es];
+
 /* -------- Init/uninstall DOS helpers (direct INT 21h, no CRT wrappers) --- */
 /* NOTE: every modify list MUST cover the full volatile set [bx cx dx si di es]
    that an INT 21h call may clobber (the DOS dispatch and any chained handler
@@ -362,31 +390,62 @@ static void scan_directory( void )
 
 /* -------- History helpers ------------------------------------------------ */
 
-/* Save line from COMMAND.COM buffer (bseg:boff+2, len chars) to history */
+/* Save line from COMMAND.COM buffer (bseg:boff+2, len chars) to the history
+   file. Writes one fixed HIST_MAXLEN record at slot hist_head. Runs in the 0Ah
+   hook (InDOS==0) so direct DOS file I/O is safe; any I/O failure just skips
+   this entry (never hangs). */
 static void hist_save( unsigned bseg, unsigned boff, int len )
 {
     char far *data = (char far *)MK_FP( bseg, boff + 2 );
-    int i, prev;
-    if ( len == 0 ) return;
+    unsigned h;
+    int i;
+    if ( len == 0 || hist_path[0] == 0 ) return;
+    if ( len > HIST_MAXLEN - 1 ) len = HIST_MAXLEN - 1;
+    h = dos_open_rw( hist_path );
+    if ( h == 0xFFFF ) return;
+    /* Skip an exact (case-insensitive) duplicate of the most recent entry. */
     if ( hist_total > 0 ) {
-        prev = (hist_head - 1 + HIST_COUNT) % HIST_COUNT;
-        if ( hist_len_arr[prev] == len ) {
+        int prev = (hist_head - 1 + HIST_COUNT) % HIST_COUNT;
+        dos_lseek( h, (unsigned)prev * HIST_MAXLEN );
+        if ( dos_read( h, hist_rec, HIST_MAXLEN ) == HIST_MAXLEN
+             && (int)(unsigned char)hist_rec[0] == len ) {
             int match = 1;
             for ( i = 0; i < len; i++ ) {
-                char ca = hist_buf[prev][i], cb = data[i];
+                char ca = hist_rec[1+i], cb = data[i];
                 if ( ca >= 'a' && ca <= 'z' ) ca -= 0x20;
                 if ( cb >= 'a' && cb <= 'z' ) cb -= 0x20;
                 if ( ca != cb ) { match = 0; break; }
             }
-            if ( match ) return; /* skip exact duplicate of last entry */
+            if ( match ) { dos_close( h ); return; }
         }
     }
-    for ( i = 0; i < len && i < HIST_MAXLEN - 1; i++ )
-        hist_buf[hist_head][i] = data[i];
-    hist_buf[hist_head][i] = 0;
-    hist_len_arr[hist_head] = len;
+    /* Build the record [len][data...0pad] and write it at slot hist_head. */
+    hist_rec[0] = (char)len;
+    for ( i = 0; i < len; i++ )            hist_rec[1+i] = data[i];
+    for ( i = len; i < HIST_MAXLEN - 1; i++ ) hist_rec[1+i] = 0;
+    dos_lseek( h, (unsigned)hist_head * HIST_MAXLEN );
+    dos_write( h, hist_rec, HIST_MAXLEN );
+    dos_close( h );
     hist_head = (hist_head + 1) % HIST_COUNT;
     if ( hist_total < HIST_COUNT ) hist_total++;
+}
+
+/* Read history slot `entry` from the file into hist_rec (data at hist_rec+1,
+   length in hist_rec[0]). Returns 1 on success, 0 on any failure. Resident;
+   runs in the 0Ah hook. */
+static int hist_load( int entry )
+{
+    unsigned h;
+    if ( hist_path[0] == 0 ) return 0;
+    h = dos_open( hist_path );
+    if ( h == 0xFFFF ) return 0;
+    dos_lseek( h, (unsigned)entry * HIST_MAXLEN );
+    if ( dos_read( h, hist_rec, HIST_MAXLEN ) != HIST_MAXLEN ) {
+        dos_close( h );
+        return 0;
+    }
+    dos_close( h );
+    return 1;
 }
 
 /* Erase current line and write new content from DGROUP buffer.
@@ -694,7 +753,9 @@ static void do_readline( unsigned bseg, unsigned boff )
                 } else { con_out(0x07); continue; }
                 {
                     int entry = (hist_head - 1 - hist_idx + HIST_COUNT*2) % HIST_COUNT;
-                    len = line_replace( buf, len, hist_buf[entry], hist_len_arr[entry] );
+                    if ( hist_load( entry ) )
+                        len = line_replace( buf, len, hist_rec+1,
+                                            (unsigned char)hist_rec[0] );
                     cur = len;
                 }
             }
@@ -707,7 +768,9 @@ static void do_readline( unsigned bseg, unsigned boff )
                     len = line_replace( buf, len, hist_tmp, hist_tmp_len );
                 } else {
                     int entry = (hist_head - 1 - hist_idx + HIST_COUNT*2) % HIST_COUNT;
-                    len = line_replace( buf, len, hist_buf[entry], hist_len_arr[entry] );
+                    if ( hist_load( entry ) )
+                        len = line_replace( buf, len, hist_rec+1,
+                                            (unsigned char)hist_rec[0] );
                 }
                 cur = len;
             }
@@ -886,17 +949,21 @@ static int already_loaded( void )
     return 1;
 }
 
-/* -------- Init: command-list staging buffer ----------------------------- */
-/* The command list is built here, then written to idx_path and dropped from
-   resident memory. Staging aliases the resident hist_buf, which is empty at
-   install time (history is only filled at runtime). CMD_MAX*NAME_LEN bytes
-   (1664) fit inside sizeof hist_buf (2560), so this costs no extra memory. */
-static char *cmd_stage( int idx )
+/* -------- Init: command index is built directly on disk ------------------ */
+/* The list is written incrementally into idx_h (a NAME_LEN-record file) as it
+   is discovered, so no resident staging buffer is needed. Dedup re-reads the
+   records already written (see scan_one_path_dir). */
+
+/* Build a zero-padded NAME_LEN record from src[0..n) into rec. */
+static void cmd_rec_pack( char *rec, const char *src, int n )
 {
-    return ( (char *)hist_buf ) + idx * NAME_LEN;
+    int j;
+    if ( n > NAME_LEN - 1 ) n = NAME_LEN - 1;
+    for ( j = 0; j < n; j++ ) rec[j] = src[j];
+    for ( ; j < NAME_LEN; j++ ) rec[j] = 0;
 }
 
-/* -------- Init: load DOS internal commands into staging ----------------- */
+/* -------- Init: write DOS internal commands as index records ------------ */
 static void load_dos_cmds( void )
 {
     static const char * const cmds[] = {
@@ -905,12 +972,11 @@ static void load_dos_cmds( void )
         "RD","REM","REN","RENAME","RMDIR","SET","TIME","TYPE",
         "VER","VERIFY","VOL", 0
     };
-    int i, j;
+    char rec[NAME_LEN];
+    int i;
     for ( i = 0; cmds[i] && cmd_count < CMD_MAX; i++ ) {
-        char *slot = cmd_stage( cmd_count );
-        for ( j = 0; cmds[i][j] && j < NAME_LEN-1; j++ )
-            slot[j] = cmds[i][j];
-        slot[j] = 0;
+        cmd_rec_pack( rec, cmds[i], strlen_local( cmds[i] ) );
+        dos_write( idx_h, rec, NAME_LEN );
         cmd_count++;
     }
 }
@@ -937,7 +1003,7 @@ static void scan_one_path_dir( char far *dir, int dlen )
         ok = dos_findfirst( (void far *)pat, 0x20 );
 
         while ( ok == 0 && cmd_count < CMD_MAX ) {
-            char name[9];
+            char name[9], rec[NAME_LEN];
             ni = 0;
             while ( dta2[30+ni] && dta2[30+ni] != '.' && ni < 8 ) {
                 char c = dta2[30+ni];
@@ -946,17 +1012,19 @@ static void scan_one_path_dir( char far *dir, int dlen )
             }
             name[ni] = 0;
 
-            /* Skip duplicates */
+            /* Dedup against records already written: re-read them via LSEEK. */
             dup = 0;
+            dos_lseek( idx_h, 0 );
             for ( i = 0; i < cmd_count; i++ ) {
-                char *ce = cmd_stage( i );
-                if ( strlen_local(ce) == ni &&
-                     memcmp_local(ce, name, ni) == 0 )
+                if ( dos_read( idx_h, rec, NAME_LEN ) != NAME_LEN ) break;
+                if ( strlen_local(rec) == ni &&
+                     memcmp_local(rec, name, ni) == 0 )
                     { dup = 1; break; }
             }
             if ( !dup ) {
-                char *slot = cmd_stage( cmd_count );
-                for ( i = 0; i <= ni; i++ ) slot[i] = name[i];
+                cmd_rec_pack( rec, name, ni );
+                dos_lseek( idx_h, (unsigned)cmd_count * NAME_LEN ); /* append */
+                dos_write( idx_h, rec, NAME_LEN );
                 cmd_count++;
             }
 
@@ -1006,10 +1074,11 @@ static int env_is( char far *e, const char *name )
     return e[i] == '=';
 }
 
-/* -------- Init: build idx_path from %TEMP% (or %TMP%) ------------------- */
+/* -------- Init: build idx_path + hist_path from %TEMP% (or %TMP%) ------- */
 /* Must run before the environment block is freed. idx_path = "<tempdir>\
-   DOSTAB.IDX"; falls back to "C:\DOSTAB.IDX" if neither variable is set. */
-static void build_idx_path( void )
+   DOSTAB.IDX"; falls back to "C:\DOSTAB.IDX". hist_path is the same path with
+   the extension changed to .HST. */
+static void build_paths( void )
 {
     unsigned env_seg = *(unsigned far *)MK_FP( _psp, 0x2C );
     char far *env    = (char far *)MK_FP( env_seg, 0 );
@@ -1038,35 +1107,22 @@ static void build_idx_path( void )
         static const char fb[] = "C:\\DOSTAB.IDX";
         for ( i = 0; fb[i]; i++ ) idx_path[i] = fb[i];
         idx_path[i] = 0;
-        return;
+    } else {
+        i = tlen;
+        if ( i > 0 && idx_path[i-1] != '\\' && idx_path[i-1] != '/' )
+            idx_path[i++] = '\\';
+        {
+            static const char fn[] = "DOSTAB.IDX";
+            int k;
+            for ( k = 0; fn[k]; k++ ) idx_path[i++] = fn[k];
+            idx_path[i] = 0;
+        }
     }
 
-    i = tlen;
-    if ( i > 0 && idx_path[i-1] != '\\' && idx_path[i-1] != '/' )
-        idx_path[i++] = '\\';
-    {
-        static const char fn[] = "DOSTAB.IDX";
-        int k;
-        for ( k = 0; fn[k]; k++ ) idx_path[i++] = fn[k];
-        idx_path[i] = 0;
-    }
-}
-
-/* -------- Init: write the staged command list to idx_path --------------- */
-/* Returns 1 on success. On failure the caller disables command completion
-   (cmd_count = 0); file completion is unaffected. */
-static int write_idx_file( void )
-{
-    unsigned h, n;
-    h = dos_create( idx_path );
-    if ( h == 0xFFFF ) return 0;
-    n = (unsigned)cmd_count * NAME_LEN;
-    if ( n > 0 && dos_write( h, (char *)hist_buf, n ) != n ) {
-        dos_close( h );
-        return 0;
-    }
-    dos_close( h );
-    return 1;
+    /* hist_path = idx_path with the .IDX extension replaced by .HST */
+    for ( i = 0; idx_path[i]; i++ ) hist_path[i] = idx_path[i];
+    hist_path[i] = 0;
+    if ( i >= 3 ) { hist_path[i-3] = 'H'; hist_path[i-2] = 'S'; hist_path[i-1] = 'T'; }
 }
 
 /* -------- Install ------------------------------------------------------- */
@@ -1126,20 +1182,28 @@ int main( void )
         return 1;
     }
 
-    /* Build the command list in staging (aliased to hist_buf) and resolve the
-       index-file path from %TEMP%/%TMP%. Both read the environment, so they
-       must run before the env block is freed below. */
-    load_dos_cmds();
-    scan_path_env();
-    build_idx_path();
+    /* Resolve the %TEMP%/%TMP% paths (must run before the env block is freed),
+       then build the command index file incrementally on disk (no resident
+       staging buffer) and create an empty history file. */
+    build_paths();
 
-    /* Persist the command list to idx_path, then drop it from resident memory.
-       On failure, disable command completion (file completion still works). */
-    if ( !write_idx_file() ) {
+    idx_h = dos_create( idx_path );
+    if ( idx_h == 0xFFFF ) {
         if ( !silent )
             msg( "Warning: could not write command index; "
                  "command completion disabled.\r\n" );
         cmd_count = 0;
+    } else {
+        load_dos_cmds();    /* write DOS internals as records */
+        scan_path_env();    /* append PATH executables (deduped) */
+        dos_close( idx_h );
+    }
+
+    /* Create an empty history file; disable history if it cannot be created. */
+    {
+        unsigned hh = dos_create( hist_path );
+        if ( hh == 0xFFFF ) hist_path[0] = 0;
+        else dos_close( hh );
     }
 
     /* Free our environment block now: PATH/TEMP have been read and the resident
