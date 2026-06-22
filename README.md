@@ -16,27 +16,32 @@ line editor with its own, while leaving everything else untouched.
 - **Line editing** — Left/Right, Home/End, Del, Ins (insert/overwrite),
   Ctrl+Left/Ctrl+Right (jump word), ESC (clear line).
 - **Small footprint** — ~8.5 KB resident. The command list and the history ring
-  are kept in small files under `%TEMP%` (`TAB4DOS.IDX` / `TAB4DOS.HST`), not in
-  resident memory; with SmartDrive these reads/writes are effectively RAM-speed.
+  are kept in small files (`TAB4DOS.IDX` / `TAB4DOS.HST`) next to the EXE (or in
+  `%TEMP%` with `/usetemp`), not in resident memory; with SmartDrive these
+  reads/writes are effectively RAM-speed.
 
 ## Requirements
 
 - **CPU:** Intel 8086/8088 or later. The binary is pure 16-bit real-mode code
   with no 386- or 286-specific instructions.
-- **OS:** MS-DOS 2.0 or later (it uses only DOS 2.0+ services — file handles,
-  FindFirst/Next, the environment block, get/set interrupt vector, TSR).
-  Developed and tested on MS-DOS 6.22.
+- **OS:** MS-DOS 3.0 or later. It uses DOS 2.0+ services (file handles,
+  FindFirst/Next, environment, get/set interrupt vector, TSR) plus the program
+  path in the environment block (DOS 3.0+) to find its own directory. Developed
+  and tested on MS-DOS 6.22.
+- **Files location:** by default `TAB4DOS.IDX` / `TAB4DOS.HST` are written next
+  to `tab4dos.exe`. With `/usetemp` they go to `%TEMP%` (or `%TMP%`); if neither
+  variable is set, TAB4DOS prints an error and does not install.
 - **Optional:** SmartDrive (`SMARTDRV`) makes the per-keystroke index/history
-  file access RAM-fast. A `TEMP` or `TMP` variable is recommended; without one,
-  the files fall back to `C:\TAB4DOS.IDX` / `C:\TAB4DOS.HST`.
+  file access RAM-fast.
 
 ## Usage
 
 ```
-TAB4DOS        Install the TSR (shows a banner)
-TAB4DOS /s     Install silently (no output)
-TAB4DOS /u     Uninstall and free the resident memory
-TAB4DOS /h     Show help
+TAB4DOS          Install the TSR (shows a banner)
+TAB4DOS /s       Install silently (no output)
+TAB4DOS /u       Uninstall and free the resident memory
+TAB4DOS /h       Show help
+TAB4DOS /usetemp Store index/history in %TEMP% (default: program directory)
 ```
 
 After installing, just type at the DOS prompt and use the keys above.

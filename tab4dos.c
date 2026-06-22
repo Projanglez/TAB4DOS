@@ -16,7 +16,7 @@
 #include <dos.h>
 #include <i86.h>
 
-#define TAB4DOS_VERSION "0.10.0"
+#define TAB4DOS_VERSION "0.11.0"
 
 extern unsigned _psp;
 
@@ -471,6 +471,43 @@ static void cursor_left_n( int n )
     while ( n-- > 0 ) con_out( 0x08 );
 }
 
+/* -------- QoL: fix a trailing backslash for CD/CHDIR/DIR ----------------- */
+/* A directory completion ends in '\', but DOS rejects "CD x\" / "DIR x\".
+   If the first word is CD/CHDIR/DIR (case-insensitive) and the line ends with
+   '\', append '.' so it becomes the valid, equivalent "CD x\.". Echoes the '.'
+   so the shown line matches what is executed. buf is the far COMMAND.COM
+   buffer; returns the (possibly incremented) length. */
+static int fixup_cd_dir_backslash( char far *buf, int len )
+{
+    int maxlen = (unsigned char)buf[0];
+    static const char * const verbs[] = { "CD", "CHDIR", "DIR", 0 };
+    int p, wl, i;
+
+    if ( len < 1 || buf[2+len-1] != '\\' ) return len;
+    if ( len >= maxlen - 1 ) return len;            /* no room for '.' + CR */
+
+    p = 0;
+    while ( p < len && (buf[2+p] == ' ' || buf[2+p] == '\t') ) p++;
+    wl = 0;
+    while ( p+wl < len && buf[2+p+wl] != ' ' && buf[2+p+wl] != '\t' ) wl++;
+
+    for ( i = 0; verbs[i]; i++ ) {
+        const char *v = verbs[i];
+        int j, vl = strlen_local( v ), ok = ( vl == wl );
+        for ( j = 0; ok && j < vl; j++ ) {
+            char c = buf[2+p+j];
+            if ( c >= 'a' && c <= 'z' ) c -= 0x20;
+            if ( c != v[j] ) ok = 0;
+        }
+        if ( ok ) {
+            buf[2+len] = '.';
+            con_out( '.' );
+            return len + 1;
+        }
+    }
+    return len;
+}
+
 /* -------- Command lookup from the index file ----------------------------- */
 /* Find the target-th (0-based) command in idx_path whose name matches
    comp_base[0..comp_base_len). On success copies the name into cmd_name and
@@ -691,8 +728,9 @@ static void do_readline( unsigned bseg, unsigned boff )
 
         if ( ascii == 0x0D ) {                    /* ENTER                  */
             while ( cur < len ) { con_out( buf[2+cur] ); cur++; }
-            hist_save( bseg, boff, len );
+            hist_save( bseg, boff, len );         /* store the original line */
             hist_idx = -1;
+            len = fixup_cd_dir_backslash( buf, len );
             buf[1] = (char)len;
             buf[2+len] = 0x0D;
             con_out(0x0D); con_out(0x0A);
@@ -1074,74 +1112,103 @@ static int env_is( char far *e, const char *name )
     return e[i] == '=';
 }
 
-/* -------- Init: build idx_path + hist_path from %TEMP% (or %TMP%) ------- */
-/* Must run before the environment block is freed. idx_path = "<tempdir>\
-   TAB4DOS.IDX"; falls back to "C:\TAB4DOS.IDX". hist_path is the same path with
-   the extension changed to .HST. */
-static void build_paths( void )
+/* -------- Init: build idx_path + hist_path ------------------------------- */
+/* Must run before the environment block is freed. Default (use_temp=0): the
+   directory of our own EXE (absolute, stays valid after CWD changes). With
+   use_temp=1: %TEMP%/%TMP% (no fallback). hist_path is idx_path with .IDX
+   changed to .HST. Returns 1 on success, 0 if use_temp was requested but
+   neither TEMP nor TMP is set. */
+/* Given a directory prefix already in idx_path[0..dir_len), append a path
+   separator if needed and "TAB4DOS.IDX", then derive hist_path (.IDX -> .HST). */
+static void append_idx_filename( int dir_len )
 {
-    unsigned env_seg = *(unsigned far *)MK_FP( _psp, 0x2C );
-    char far *env    = (char far *)MK_FP( env_seg, 0 );
-    int tlen = 0, prio = 0;           /* 2 = TEMP found, 1 = TMP found */
-    int i;
-
-    /* Accumulate the chosen temp directory directly into idx_path; a later
-       higher-priority match (TEMP over TMP) simply overwrites from the start. */
-    while ( *env ) {
-        int take = 0;
-        if ( env_is( env, "TEMP" ) )          take = 2;
-        else if ( env_is( env, "TMP" ) )      take = 1;
-        if ( take > prio ) {
-            char far *v = env;
-            while ( *v && *v != '=' ) v++;
-            if ( *v == '=' ) v++;
-            tlen = 0;
-            while ( *v && tlen < 64 ) idx_path[tlen++] = *v++;
-            prio = take;
-        }
-        while ( *env ) env++;
-        env++;
-    }
-
-    if ( prio == 0 ) {
-        static const char fb[] = "C:\\TAB4DOS.IDX";
-        for ( i = 0; fb[i]; i++ ) idx_path[i] = fb[i];
-        idx_path[i] = 0;
-    } else {
-        i = tlen;
-        if ( i > 0 && idx_path[i-1] != '\\' && idx_path[i-1] != '/' )
-            idx_path[i++] = '\\';
-        {
-            static const char fn[] = "TAB4DOS.IDX";
-            int k;
-            for ( k = 0; fn[k]; k++ ) idx_path[i++] = fn[k];
-            idx_path[i] = 0;
-        }
-    }
-
-    /* hist_path = idx_path with the .IDX extension replaced by .HST */
+    static const char fn[] = "TAB4DOS.IDX";
+    int i = dir_len, k;
+    if ( i > 0 && idx_path[i-1] != '\\' && idx_path[i-1] != '/' )
+        idx_path[i++] = '\\';
+    for ( k = 0; fn[k]; k++ ) idx_path[i++] = fn[k];
+    idx_path[i] = 0;
     for ( i = 0; idx_path[i]; i++ ) hist_path[i] = idx_path[i];
     hist_path[i] = 0;
     if ( i >= 3 ) { hist_path[i-3] = 'H'; hist_path[i-2] = 'S'; hist_path[i-1] = 'T'; }
+}
+
+static int build_paths( int use_temp )
+{
+    unsigned env_seg = *(unsigned far *)MK_FP( _psp, 0x2C );
+    char far *env    = (char far *)MK_FP( env_seg, 0 );
+    int dlen = 0;
+
+    if ( use_temp ) {
+        /* %TEMP% (preferred) or %TMP%; no fallback -> caller errors out. */
+        int prio = 0;                       /* 2 = TEMP, 1 = TMP */
+        char far *e = env;
+        while ( *e ) {
+            int take = 0;
+            if ( env_is( e, "TEMP" ) )       take = 2;
+            else if ( env_is( e, "TMP" ) )   take = 1;
+            if ( take > prio ) {
+                char far *v = e;
+                while ( *v && *v != '=' ) v++;
+                if ( *v == '=' ) v++;
+                dlen = 0;
+                while ( *v && dlen < 64 ) idx_path[dlen++] = *v++;
+                prio = take;
+            }
+            while ( *e ) e++;
+            e++;
+        }
+        if ( prio == 0 ) return 0;          /* neither TEMP nor TMP set */
+    } else {
+        /* Program directory: skip the env vars (double null), skip the string
+           count word, read the program path (DOS 3.0+), keep up to the last
+           '\'. The path is absolute, so it stays valid after CWD changes. */
+        char far *p;
+        int i, last = -1;
+        while ( *env ) { while ( *env ) env++; env++; }   /* -> 2nd null */
+        env++;                                            /* skip 2nd null */
+        env += 2;                                         /* skip count word */
+        p = env;
+        for ( i = 0; p[i] && i < 64; i++ ) {
+            idx_path[i] = (char)p[i];
+            if ( p[i] == '\\' || p[i] == '/' ) last = i;
+        }
+        dlen = ( last >= 0 ) ? last + 1 : 0;              /* through last sep */
+    }
+
+    append_idx_filename( dlen );
+    return 1;
 }
 
 /* -------- Install ------------------------------------------------------- */
 int main( void )
 {
     unsigned para;
-    int silent = 0, do_help = 0, do_uninst = 0;
+    int silent = 0, do_help = 0, do_uninst = 0, do_usetemp = 0;
 
     /* Parse command tail at PSP:0x80 (len byte, chars, 0x0D-terminated).
+       Token-based (whole switch word), so "/usetemp" is not mistaken for "/u".
        Avoids pulling the CRT argc/argv parser into the resident image. */
     {
         unsigned char far *tail = (unsigned char far *)MK_FP( _psp, 0x80 );
-        int n = tail[0], i;
-        for ( i = 1; i <= n; i++ ) {
+        int n = tail[0], i = 1;
+        while ( i <= n ) {
             if ( tail[i] == '/' || tail[i] == '-' ) {
-                char sw = tail[i+1];
-                if ( sw == 's' || sw == 'S' )                    silent    = 1;
-                else if ( sw == 'u' || sw == 'U' )               do_uninst = 1;
-                else if ( sw == 'h' || sw == 'H' || sw == '?' )  do_help   = 1;
+                char tok[12]; int t = 0;
+                i++;
+                while ( i <= n && t < 11 && tail[i] != ' ' && tail[i] != '\t'
+                        && tail[i] != '/' && tail[i] != '-' ) {
+                    char c = tail[i];
+                    if ( c >= 'A' && c <= 'Z' ) c += 0x20;   /* lowercase */
+                    tok[t++] = c; i++;
+                }
+                tok[t] = 0;
+                if      ( tok[0]=='s' && t==1 )                    silent    = 1;
+                else if ( tok[0]=='u' && t==1 )                    do_uninst = 1;
+                else if ( ( tok[0]=='h' || tok[0]=='?' ) && t==1 ) do_help   = 1;
+                else if ( strcmp_ci( tok, "usetemp" ) == 0 )       do_usetemp = 1;
+            } else {
+                i++;
             }
         }
     }
@@ -1150,11 +1217,12 @@ int main( void )
         msg( "TAB4DOS v" TAB4DOS_VERSION " - Tab-Completion for MS-DOS\r\n" );
         msg( "(c) 2026 Projanglez - www.github.com/projanglez/tab4dos\r\n" );
         msg( "\r\n" );
-        msg( "Usage: TAB4DOS [/s] [/u] [/h]\r\n" );
+        msg( "Usage: TAB4DOS [/s] [/u] [/h] [/usetemp]\r\n" );
         msg( "\r\n" );
-        msg( "  /s   Silent mode (suppress all output)\r\n" );
-        msg( "  /u   Uninstall TSR from memory\r\n" );
-        msg( "  /h   Show this help\r\n" );
+        msg( "  /s        Silent mode (suppress all output)\r\n" );
+        msg( "  /u        Uninstall TSR from memory\r\n" );
+        msg( "  /h        Show this help\r\n" );
+        msg( "  /usetemp  Store index/history in %TEMP% (default: program dir)\r\n" );
         msg( "\r\n" );
         msg( "Keys:\r\n" );
         msg( "  TAB              Complete filename or command\r\n" );
@@ -1174,18 +1242,26 @@ int main( void )
     if ( !silent ) {
         msg( "TAB4DOS v" TAB4DOS_VERSION " - Tab-Completion for MS-DOS\r\n" );
         msg( "(c) 2026 Projanglez - www.github.com/projanglez/tab4dos\r\n" );
-        msg( "\r\n" );
     }
 
     if ( already_loaded() ) {
-        if ( !silent ) msg( "Error loading TSR: Already loaded\r\n\r\n" );
+        if ( !silent ) msg( "TAB4DOS is already installed.\r\n\r\n" );
         return 1;
     }
 
-    /* Resolve the %TEMP%/%TMP% paths (must run before the env block is freed),
-       then build the command index file incrementally on disk (no resident
-       staging buffer) and create an empty history file. */
-    build_paths();
+    /* Resolve idx_path/hist_path (must run before the env block is freed):
+       default = program directory, or %TEMP%/%TMP% with /usetemp. With
+       /usetemp and neither variable set, abort without installing. Then build
+       the command index incrementally on disk and create an empty history. */
+    if ( do_usetemp ) {
+        if ( !build_paths( 1 ) ) {
+            if ( !silent )
+                msg( "Error: /usetemp set but neither TEMP nor TMP is defined.\r\n" );
+            return 1;
+        }
+    } else {
+        build_paths( 0 );
+    }
 
     idx_h = dos_create( idx_path );
     if ( idx_h == 0xFFFF ) {
@@ -1227,7 +1303,7 @@ int main( void )
     old21 = (void (__interrupt __far *)())dos_getvect21();
     dos_setvect21( (void far *)new21 );
 
-    if ( !silent ) msg( "TSR successfully loaded\r\n\r\n" );
+    if ( !silent ) msg( "TAB4DOS installed.\r\n\r\n" );
 
     /* Keep PSP + code + DGROUP + stack. INIT_TEXT is linked ABOVE the stack
        (see tab4dos.lnk), so it lies past SS:SP and is freed by this. Computed
