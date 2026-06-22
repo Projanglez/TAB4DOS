@@ -2,133 +2,138 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-# DOSTAB — DOS-TSR für TAB-Dateinamen-Completion
+# DOSTAB — DOS TSR for TAB filename completion
 
-Resident-Programm (TSR) für **MS-DOS 6.22 auf echtem 386**. Hookt
-`INT 21h / AH=0Ah` und ersetzt COMMAND.COMs Zeileneingabe durch einen
-eigenen Editor mit TAB-Completion (4DOS-artiges Zykeln durch Treffer).
+Resident program (TSR) for **MS-DOS 6.22 on a real 386**. Hooks
+`INT 21h / AH=0Ah` and replaces COMMAND.COM's line input with its own
+editor providing TAB completion (4DOS-style cycling through matches).
 
 ## Build & Test
 
-- Compiler: **Open Watcom 16-bit, Real Mode** — NICHT `wcl386`. Ein TSR
-  läuft im Real Mode.
-- **`-s` ist ZWINGEND** (in `build.bat` gesetzt): schaltet die
-  Stack-Overflow-Checks (`__STK`-Aufruf an jedem Funktionseingang) ab. Der
-  residente Code läuft auf COMMAND.COMs/DOS' Stack; `__STK` vergleicht SP mit
-  *unseren* Runtime-Stack-Grenzen, meldet dort fälschlich Overflow und hängt
-  den Rechner auf. War die Ursache mehrerer „Eingabe tot + Beep"-Hänger
-  (v0.1–v0.3). Prüfen mit `wdis -a dostab.obj` → es darf KEIN `call __STK`
-  im residenten Code stehen.
-- Open Watcom liegt unter `C:\WATCOM`, Binaries in `binnt64\`. `build.bat`
-  ruft `%WATCOM%\owsetenv.bat` auf und setzt den PATH automatisch.
-- Bauen: aus CMD `build.bat` aufrufen (nicht per Doppelklick im Explorer —
-  dann fehlt das Argument). Ausgabe: `dostab.exe`.
-- **KEIN DOSBox-Test.** DOSBox hat eine eigene TAB-Completion, die die unsere
-  überlagert — die Ergebnisse sind dort nicht aussagekräftig. Der Anwender
-  testet **ausschließlich direkt auf echter 386-Hardware**.
-- **Compile-Loop ist closed-loop** über Claude Code: Agent baut via
-  `build.bat`, liest `wcl`-Fehler, fixt, baut neu.
-- **Laufzeit-/Verhaltenstest ist IMMER manuell auf echtem 386** (durch den
-  Anwender). Nie ungetestet als „fertig" melden — ein fehlerhafter
-  INT-21h-Hook kann den Rechner hängen lassen.
+- Compiler: **Open Watcom 16-bit, Real Mode** — NOT `wcl386`. A TSR
+  runs in real mode.
+- **`-s` is MANDATORY** (set in `build.bat`): it disables the
+  stack-overflow checks (the `__STK` call at every function entry). The
+  resident code runs on COMMAND.COM's/DOS' stack; `__STK` compares SP against
+  *our* runtime stack limits, falsely reports an overflow there and hangs
+  the machine. This was the cause of several "input dead + beep" hangs
+  (v0.1–v0.3). Check with `wdis -a dostab.obj` → there must be NO `call __STK`
+  in the resident code.
+- Open Watcom lives under `C:\WATCOM`, binaries in `binnt64\`. `build.bat`
+  calls `%WATCOM%\owsetenv.bat` and sets the PATH automatically.
+- Build: invoke `build.bat` from CMD (not by double-clicking in Explorer —
+  then the argument is missing). Output: `dostab.exe`.
+- **NO DOSBox testing.** DOSBox has its own TAB completion that overlays
+  ours — the results there are not meaningful. The user
+  tests **exclusively on real 386 hardware**.
+- **The compile loop is closed-loop** via Claude Code: the agent builds via
+  `build.bat`, reads `wcl` errors, fixes, rebuilds.
+- **Runtime/behavior testing is ALWAYS manual on a real 386** (by the
+  user). Never report "done" untested — a faulty
+  INT 21h hook can hang the machine.
 
-## Architektur-Kern (Invarianten, nicht kaputt machen)
+## Architecture core (invariants — do not break)
 
-- **InDOS == 0 beim Eintritt in den 0Ah-Hook.** Wir fangen INT 21h *vor*
-  dem DOS-Handler ab, deshalb dürfen wir selbst DOS-Funktionen (02h,
-  4Eh/4Fh, 1Ah/2Fh) aufrufen. Diese Invariante ist die Grundlage von allem.
-- **Im Hook ist `SS != DS`!** Der `__interrupt`-Prolog setzt DS=DGROUP, aber
-  SS bleibt der Stack des Aufrufers (COMMAND.COM). Ein `(void far*)`-Cast
-  eines **Stack**-Arrays nimmt aber DS → falsches Segment. Puffer, die DOS
-  füllt (z.B. die DTA für FindFirst), MÜSSEN **globale** Variablen sein
-  (liegen in DGROUP, dann stimmt DS:offset). Sonst schreibt DOS woanders hin
-  als wir lesen (las Stack-Müll, `dta[30]` war 0x5E, Skip von `.`/`..` ging
-  nicht). Explizite `MK_FP(seg,off)` mit übergebenem Segment (z.B. COMMAND.COMs
-  Puffer aus `r.w.ds`/`r.w.dx`) sind ok.
-- **Aus demselben Grund: KEINE `&stackvar`-Pointer über Funktionsgrenzen im
-  Hook!** `&local` ist ein *near*-Pointer (Offset), den die gerufene Funktion
-  über DS dereferenziert — die Variable liegt aber auf SS. Im Hook (SS!=DS)
-  liest sie Müll. War der Grund, warum TAB-Completion `len` als 0xCC statt 2
-  sah. Lösung: Werte per Wert übergeben und zurückgeben (oder Globals nutzen).
-- **Resident-Code: keine non-reentrant C-Runtime.** Kein `printf`/`malloc`
-  im Hook.
-- **KEIN Watcom-Int-Wrapper im Resident benutzen — weder `int86` NOCH
-  `intdos`/`intdosx`!** Alle laufen über denselben Int-Dispatch-Wrapper, der
-  im residenten Interrupt-Kontext versagt (auf HW bestätigt):
-  - `int86`/INT 16h → Taste nie konsumiert, Puffer voll, „Eingabe tot + Beep".
-  - `intdos`/INT 21h AH=02h (Echo) → falsches Zeichen bei DOS (0xDB-Block).
-  - `intdosx`/INT 21h FindFirst (Scan) → findet nichts, TAB beept nur.
-  Stattdessen für JEDEN residenten DOS/BIOS-Aufruf: **direkter `INT`-Opcode
-  per `#pragma aux`** (z.B. `int 0x16`/`int 0x10`/`int 0x21`). DOS-Carry per
-  `sbb ax,ax` zurückholen; Far-Pointer in DX:AX. `intdosx` ist NUR im
-  Init-Code von `main()` (vor `_dos_keep`, Hook noch nicht aktiv) ok.
-  Per `wdis` verifizieren, dass im Resident nur literale `int`-Opcodes stehen.
-- **DTA:** vor `FindFirst` eigene DTA setzen, danach COMMAND.COMs DTA
-  restaurieren.
-- **new21:** Funktion 0Ah selbst behandeln (`return` ⇒ IRET, nicht chainen),
-  alle anderen Funktionen via `_chain_intr`.
-- **Init-Code (`main`, Banner) ist unkritisch** — läuft nur einmal vor
-  `_dos_keep`. Größe/Reinheit zählt nur im residenten Teil.
+- **InDOS == 0 on entry to the 0Ah hook.** We intercept INT 21h *before*
+  the DOS handler, so we may call DOS functions ourselves (02h,
+  4Eh/4Fh, 1Ah/2Fh). This invariant is the foundation of everything.
+  It includes **handle-based file I/O** (3Dh/3Fh/40h/3Eh/42h/3Ch): the command
+  cache (`idx_path`) and history (`hist_path`) live in `%TEMP%` files, not
+  resident. Even **writing per command** (history on ENTER) is proven in the
+  hook on real HW (v0.10). Every file op MUST be fail-safe (on error →
+  skip/beep, NEVER hang) — patterns like `cmd_find`/`hist_load`.
+- **In the hook, `SS != DS`!** The `__interrupt` prolog sets DS=DGROUP, but
+  SS stays the caller's stack (COMMAND.COM). A `(void far*)` cast
+  of a **stack** array takes DS, however → wrong segment. Buffers that DOS
+  fills (e.g. the DTA for FindFirst) MUST be **global** variables
+  (they live in DGROUP, then DS:offset is correct). Otherwise DOS writes to a
+  different place than we read (read stack garbage, `dta[30]` was 0x5E, skipping
+  `.`/`..` failed). Explicit `MK_FP(seg,off)` with a passed-in segment (e.g.
+  COMMAND.COM's buffer from `r.w.ds`/`r.w.dx`) is fine.
+- **For the same reason: NO `&stackvar` pointers across function boundaries in the
+  hook!** `&local` is a *near* pointer (offset) that the called function
+  dereferences via DS — but the variable lives on SS. In the hook (SS!=DS)
+  it reads garbage. This was why TAB completion saw `len` as 0xCC instead of 2.
+  Fix: pass values by value and return them (or use globals).
+- **Resident code: no non-reentrant C runtime.** No `printf`/`malloc`
+  in the hook.
+- **Do NOT use a Watcom int wrapper in the resident — neither `int86` NOR
+  `intdos`/`intdosx`!** They all go through the same int-dispatch wrapper, which
+  fails in the resident interrupt context (confirmed on HW):
+  - `int86`/INT 16h → key never consumed, buffer full, "input dead + beep".
+  - `intdos`/INT 21h AH=02h (echo) → wrong character at DOS (0xDB block).
+  - `intdosx`/INT 21h FindFirst (scan) → finds nothing, TAB only beeps.
+  Instead, for EVERY resident DOS/BIOS call: **a direct `INT` opcode
+  via `#pragma aux`** (e.g. `int 0x16`/`int 0x10`/`int 0x21`). Recover the DOS
+  carry via `sbb ax,ax`; far pointer in DX:AX. `intdosx` is OK ONLY in the
+  init code of `main()` (before `_dos_keep`, hook not yet active).
+  Verify via `wdis` that only literal `int` opcodes appear in the resident.
+- **DTA:** set our own DTA before `FindFirst`, then restore COMMAND.COM's DTA
+  afterwards.
+- **new21:** handle function 0Ah ourselves (`return` ⇒ IRET, do not chain),
+  all other functions via `_chain_intr`.
+- **Init code (`main`, banner) is uncritical** — it runs only once before
+  `_dos_keep`. Size/purity matters only in the resident part.
 
-## Bekannte Risikostellen
+## Known risk areas
 
-1. **Stack-Checks (`__STK`)** — bei jedem „Eingabe tot/Hänger" ZUERST prüfen,
-   ob `-s` aktiv ist und kein `__STK` im residenten Code steht (siehe Build).
-2. `_dos_keep`-Paragraphenrechnung in `main()` — bei Instabilität als Nächstes
-   hier prüfen.
-3. `INTPACK`-Member (`r.w.ds` / `r.w.dx`) und `_chain_intr` —
-   versionsabhängig in Open Watcom. (DS wird im `__interrupt`-Prolog korrekt
-   auf DGROUP gesetzt — per `wdis` verifiziert.)
-4. ENTER gibt CR+LF aus (bei Doppel-Leerzeile das `0x0A` entfernen).
-5. **Environment-Block beim INSTALL freigeben, NICHT beim Uninstall** (v0.8).
-   Nach `scan_path_env()` (PATH gelesen) den eigenen Env-Block freigeben
-   (`AH=49h` auf PSP:0x2C) und `PSP:0x2C = 0` setzen — im normalen Prozess-
-   kontext, daher sicher. Spart ~Env-Größe resident. `do_uninstall` gibt dann
-   NUR den Programmblock (`psp_seg`) frei. Sackgassen, die das verursachten:
-   den Env-Block IM Uninstall freizugeben hing den Rechner; ihn liegenzulassen
-   erzeugte einen verwaisten MCB-Block, der den ZWEITEN install/uninstall-
-   Zyklus zum Hängen brachte (Beep pro Taste = toter 0Ah-Hook).
-6. **`#pragma aux` modify-Listen bei INT 21h/10h/16h** — MÜSSEN den vollen
-   flüchtigen Satz `[bx cx dx si di es]` (plus benutzte) angeben. Der
-   DOS-Dispatch und gechainte Handler dürfen diese Register zerstören. Eine
-   zu enge Liste lässt den Compiler einen lebenden Wert über den `int`-Aufruf
-   in einem dieser Register halten → Korruption (latenter Bug in v0.8 behoben).
-   **Gilt AUCH für die residenten BIOS-Primitive `con_out` (INT 10h) und
-   `get_key` (INT 16h), nicht nur für die INT-21h-Helfer!** Bei VOLLER Config
-   hooken Maus-/Tastatur-/Display-TSRs (CTMOUSE, KEYB, DISPLAY/ANSI) diese
-   BIOS-Interrupts und zerstören Register, die das nackte BIOS bewahrt. Eine
-   enge Liste (`con_out` hatte nur `[ah bx]`, `get_key` gar keine) ist bei
-   F5-Boot zufällig korrekt, **hängt aber bei vollem Boot**: z.B. wurde `old_vec`
-   in `do_uninstall` über den `msg()`-Aufruf in DX gehalten, der gehookte INT 10h
-   zerstörte DX → falscher INT-21h-Vektor restauriert → Hänger. Voller Satz
-   `[ah bx cx dx si di es]` zwingt den Compiler, lebende Werte über den Aufruf
-   auf den Stack zu spillen (per `wdis` verifiziert: `msg_` `push dx … pop dx`).
-   Solche Bugs sind auf F5-Boot UNSICHTBAR — immer mit voller Config testen.
-7. **Transient-Code-Split (INIT_TEXT/INIT_CODE):** Init/Uninstall-Funktionen
-   liegen via `#pragma code_seg` in `INIT_TEXT`, per `dostab.lnk` ORDER über
-   den Stack gelegt und durch `_dos_keep` freigegeben. Keep-Größe NICHT aus
-   einem Code-Offset rechnen (INIT_TEXT bekommt einen eigenen Frame, Offset
-   wird 0!) — die bewährte `(get_ss()-_psp)+(get_sp()/16)+16`-Formel nutzen.
-   Resident darf NIE eine INIT_TEXT-Funktion aufrufen (per `wdis` prüfen).
-8. **`/u` MUSS via direktem `INT 21h AH=4Ch` (`dos_exit()`) terminieren, NICHT
-   über den Watcom-C-Runtime-Exit.** Nach erfolgreichem Unhook (`AH=25h`) +
-   Free (`AH=49h`) — beide auf HW als OK verifiziert (Marker `1`/`2`/`3`) —
-   **hängt der C-Runtime-Exit** (FiniRtns/atexit/Null-Pointer-Check) bei VOLLER
-   Config (EMM386/UMB, DOS=HIGH, STACKS, geladene TSRs); bei F5 läuft er durch.
-   `do_uninstall` ruft daher am Ende `dos_exit()` und kehrt nie zur C-Runtime
-   zurück. Standard-TSR-Teardown: **Unhook → Free → AH=4Ch.** `return 0` danach
-   ist unerreichbar (nur für den Compiler).
-9. **Diagnose-Marker im `/u`-Teardown: NUR inline `con_out`, KEINE Helfer-
-   Funktion.** Ein Hex-Dump-Helfer (`con_hex16`) bekam vom `-os`-Optimierer
-   einen mit `do_uninstall` GETEILTEN Epilog (Cross-Function-Tail-Merge via
-   gemeinsames `L$xxx`); das verfälschte den Rücksprung und ließ `/u` mitten im
-   Dump sauber terminieren (statt zu hängen) → falsche Spur. Inline-`con_out`
-   (per `#pragma aux` ge-inlined, kein Call, kein geteilter Epilog) ist als
-   Marker zuverlässig.
+1. **Stack checks (`__STK`)** — on every "input dead/hang", FIRST check
+   whether `-s` is active and no `__STK` is in the resident code (see Build).
+2. `_dos_keep` paragraph calculation in `main()` — on instability, check
+   here next.
+3. `INTPACK` members (`r.w.ds` / `r.w.dx`) and `_chain_intr` —
+   version-dependent in Open Watcom. (DS is set correctly to DGROUP in the
+   `__interrupt` prolog — verified via `wdis`.)
+4. ENTER outputs CR+LF (on a double blank line, drop the `0x0A`).
+5. **Free the environment block on INSTALL, NOT on uninstall** (v0.8).
+   After `scan_path_env()` (PATH read), free our own env block
+   (`AH=49h` on PSP:0x2C) and set `PSP:0x2C = 0` — in the normal process
+   context, therefore safe. Saves ~the env size resident. `do_uninstall` then
+   frees ONLY the program block (`psp_seg`). Dead ends that caused this:
+   freeing the env block IN uninstall hung the machine; leaving it in place
+   created an orphaned MCB block that hung the SECOND install/uninstall
+   cycle (beep per key = dead 0Ah hook).
+6. **`#pragma aux` modify lists for INT 21h/10h/16h** — MUST list the full
+   volatile set `[bx cx dx si di es]` (plus the ones used). The
+   DOS dispatch and chained handlers may destroy these registers. A
+   too-narrow list lets the compiler keep a live value across the `int` call
+   in one of these registers → corruption (latent bug fixed in v0.8).
+   **Applies ALSO to the resident BIOS primitives `con_out` (INT 10h) and
+   `get_key` (INT 16h), not only the INT 21h helpers!** Under a FULL config,
+   mouse/keyboard/display TSRs (CTMOUSE, KEYB, DISPLAY/ANSI) hook these
+   BIOS interrupts and destroy registers that bare BIOS preserves. A
+   narrow list (`con_out` had only `[ah bx]`, `get_key` none at all) is
+   accidentally correct on an F5 boot, **but hangs on a full boot**: e.g.
+   `old_vec` in `do_uninstall` was held in DX across the `msg()` call, the
+   hooked INT 10h destroyed DX → a wrong INT 21h vector was restored → hang.
+   The full set `[ah bx cx dx si di es]` forces the compiler to spill live
+   values across the call onto the stack (verified via `wdis`: `msg_`
+   `push dx … pop dx`). Such bugs are INVISIBLE on an F5 boot — always test
+   with a full config.
+7. **Transient code split (INIT_TEXT/INIT_CODE):** init/uninstall functions
+   live via `#pragma code_seg` in `INIT_TEXT`, placed above the stack via
+   `dostab.lnk` ORDER and freed by `_dos_keep`. Do NOT compute the keep size
+   from a code offset (INIT_TEXT gets its own frame, the offset becomes 0!) —
+   use the proven `(get_ss()-_psp)+(get_sp()/16)+16` formula.
+   The resident must NEVER call an INIT_TEXT function (check via `wdis`).
+8. **`/u` MUST terminate via a direct `INT 21h AH=4Ch` (`dos_exit()`), NOT
+   via the Watcom C-runtime exit.** After a successful unhook (`AH=25h`) +
+   free (`AH=49h`) — both verified OK on HW (markers `1`/`2`/`3`) —
+   **the C-runtime exit hangs** (FiniRtns/atexit/null-pointer check) under a
+   FULL config (EMM386/UMB, DOS=HIGH, STACKS, loaded TSRs); on F5 it runs
+   through. `do_uninstall` therefore calls `dos_exit()` at the end and never
+   returns to the C runtime. Standard TSR teardown: **Unhook → Free → AH=4Ch.**
+   The `return 0` after it is unreachable (only to satisfy the compiler).
+9. **Diagnostic markers in the `/u` teardown: ONLY inline `con_out`, NO helper
+   function.** A hex-dump helper (`con_hex16`) was given by the `-os` optimizer
+   an epilogue SHARED with `do_uninstall` (cross-function tail merge via a
+   common `L$xxx`); this corrupted the return and made `/u` terminate cleanly
+   mid-dump (instead of hanging) → a false trail. Inline `con_out` (inlined via
+   `#pragma aux`, no call, no shared epilogue) is reliable as a marker.
 
-## Arbeitsweise
+## Workflow
 
-- Vor jedem neuen Feature `/plan`, danach in **kleinen, testbaren
-  Inkrementen** arbeiten und nach jedem Schritt einchecken.
-- Nach jedem grünen Build + `wdis`-Prüfung: der Anwender macht den
-  Smoke-Test auf echtem 386, dann erst weiter. (Kein DOSBox.)
+- Before each new feature `/plan`, then work in **small, testable
+  increments** and check in after each step.
+- After each green build + `wdis` check: the user runs the
+  smoke test on a real 386, and only then continue. (No DOSBox.)
