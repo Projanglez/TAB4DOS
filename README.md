@@ -9,6 +9,8 @@ line editor with its own, while leaving everything else untouched.
 
 ![TAB4DOS demo](tab4dos-demo.gif)
 
+Download: <https://github.com/Projanglez/TAB4DOS/releases/latest>
+
 ## Features
 
 - **TAB / Shift+TAB** — complete and cycle matches (forward / backward) for
