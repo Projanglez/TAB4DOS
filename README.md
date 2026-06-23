@@ -48,6 +48,25 @@ TAB4DOS /usetemp Store index/history in %TEMP% (default: program directory)
 
 After installing, just type at the DOS prompt and use the keys above.
 
+## Prior art
+
+Adding history and filename completion to the bare `COMMAND.COM` prompt is an
+old idea, and TAB4DOS stands on the shoulders of some classics:
+
+- **DOSKEY** (Microsoft) — the standard TSR that added command history and
+  macros, but no filename completion.
+- **Enhanced DOSKEY** (Paul Houle) — a drop-in DOSKEY replacement that adds
+  Tab auto-completion.
+- **4DOS / NDOS** (JP Software) — full `COMMAND.COM` replacements with
+  completion and rich line editing (the "4DOS-style" cycling that inspired the
+  TAB behaviour here).
+- Older editors such as **CED**, **ANARKEY**, **DOSEDIT** and **CMDEDIT**.
+
+TAB4DOS aims for a single, tiny (~9 KB) TSR that combines bash-style TAB
+completion, history, and full line editing, while keeping COMMAND.COM itself
+in place — and keeps its data out of resident memory by offloading the
+command index and history ring to small files.
+
 ## Build
 
 Built with **Open Watcom 16-bit (real mode)** — not `wcl386`; a TSR runs in real
@@ -71,6 +90,13 @@ mode.
   built-in TAB completion that overrides this tool, so results there are not
   meaningful.
 - This software was developed with the help of an AI coding assistant (Claude Code).
+
+## Contributing
+
+Bug reports and ideas are welcome — please open an
+[issue](https://github.com/Projanglez/TAB4DOS/issues). Since this is a real-mode
+DOS TSR, see [CHANGELOG.md](CHANGELOG.md) for the version history and the build
+notes above before sending a pull request.
 
 ## License
 

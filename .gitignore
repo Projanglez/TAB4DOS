@@ -5,5 +5,6 @@
 *.lst
 *.dis
 
-# Local Claude Code guidance (not published)
+# Local Claude Code guidance / config (not published)
 CLAUDE.md
+.claude/
