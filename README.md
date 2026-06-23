@@ -51,16 +51,7 @@ After installing, just type at the DOS prompt and use the keys above.
 ## Prior art
 
 Adding history and filename completion to the bare `COMMAND.COM` prompt is an
-old idea, and TAB4DOS stands on the shoulders of some classics:
-
-- **DOSKEY** (Microsoft) — the standard TSR that added command history and
-  macros, but no filename completion.
-- **Enhanced DOSKEY** (Paul Houle) — a drop-in DOSKEY replacement that adds
-  Tab auto-completion.
-- **4DOS / NDOS** (JP Software) — full `COMMAND.COM` replacements with
-  completion and rich line editing (the "4DOS-style" cycling that inspired the
-  TAB behaviour here).
-- Older editors such as **CED**, **ANARKEY**, **DOSEDIT** and **CMDEDIT**.
+old idea, kudos for all persons who developed a similar program.
 
 TAB4DOS aims for a single, tiny (~9 KB) TSR that combines bash-style TAB
 completion, history, and full line editing, while keeping COMMAND.COM itself
