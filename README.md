@@ -7,6 +7,8 @@ standard `COMMAND.COM` prompt.
 It hooks `INT 21h / AH=0Ah` (buffered line input) and replaces COMMAND.COM's
 line editor with its own, while leaving everything else untouched.
 
+![TAB4DOS demo](tab4dos-demo.gif)
+
 ## Features
 
 - **TAB / Shift+TAB** — complete and cycle matches (forward / backward) for
