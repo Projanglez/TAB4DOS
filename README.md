@@ -76,7 +76,7 @@ mode.
 
 MIT — see [LICENSE](LICENSE).
 
-TAB4DOS is free and donationware: if it saves you some keystrokes, you can
+TAB4DOS is free and donationware: If you like it, you can
 leave a tip at [liberapay.com/Projanglez](https://liberapay.com/Projanglez).
 Entirely optional — the tool is and stays fully functional without it.
 
