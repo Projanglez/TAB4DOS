@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 system dos
 name tab4dos.exe
 option quiet, map=tab4dos.map, stack=512

@@ -1,4 +1,5 @@
 @echo off
+rem SPDX-License-Identifier: MIT
 rem ============================================================
 rem  TAB4DOS Build  -  Open Watcom 16-bit (Real Mode)
 rem  Usage:  build.bat        -> compile

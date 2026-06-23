@@ -70,4 +70,12 @@ mode.
   meaningful.
 - This software was developed with the help of an AI coding assistant (Claude Code).
 
-(c) 2026 Projanglez
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+TAB4DOS is free and donationware: if it saves you some keystrokes, you can
+leave a tip at [liberapay.com/Projanglez](https://liberapay.com/Projanglez).
+Entirely optional — the tool is and stays fully functional without it.
+
+Copyright (c) 2026 Projanglez

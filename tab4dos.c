@@ -2,6 +2,9 @@
  * TAB4DOS - TAB filename completion for MS-DOS
  * Open Watcom C (16-bit, real mode). Version: see TAB4DOS_VERSION below.
  *
+ * Copyright (c) 2026 Projanglez
+ * SPDX-License-Identifier: MIT
+ *
  * Architecture: standalone line editor, hooks INT 21h / AH=0Ah only.
  * Keys read via INT 16h (as normal caller, no hook). InDOS==0 guaranteed on entry.
  * SS != DS in hook: all buffers must be global (DGROUP). No int86/intdos in resident code.
@@ -1232,6 +1235,8 @@ int main( void )
         msg( "  Del/Ins          Delete char / toggle insert mode\r\n" );
         msg( "  Ctrl+Left/Right  Jump word left/right\r\n" );
         msg( "  ESC              Clear current line\r\n" );
+        msg( "\r\n" );
+        msg( "Free donationware - tips welcome: liberapay.com/Projanglez\r\n" );
         return 0;
     }
 
