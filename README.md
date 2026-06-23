@@ -23,6 +23,7 @@ Download: <https://github.com/Projanglez/TAB4DOS/releases/latest>
   are kept in small files (`TAB4DOS.IDX` / `TAB4DOS.HST`) next to the EXE (or in
   `%TEMP%` with `/usetemp`), not in resident memory; with SmartDrive these
   reads/writes are effectively RAM-speed.
+- See [full changelog](https://github.com/Projanglez/TAB4DOS/blob/main/CHANGELOG.md) for more details
 
 ## Requirements
 
