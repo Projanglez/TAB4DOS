@@ -19,7 +19,7 @@
 #include <dos.h>
 #include <i86.h>
 
-#define TAB4DOS_VERSION "0.11.0"
+#define TAB4DOS_VERSION "1.0.0"
 
 extern unsigned _psp;
 

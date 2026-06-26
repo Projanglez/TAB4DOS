@@ -5,7 +5,7 @@ All notable changes to TAB4DOS are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.11.0] - 2026-06-22
+## [1.0.0] - 2026-06-26
 
 ### Added
 - `/usetemp` switch — store the index/history files in `%TEMP%` / `%TMP%`
@@ -82,4 +82,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Initial TSR with TAB filename completion for MS-DOS, hooking
   `INT 21h / AH=0Ah`.
 
-[0.11.0]: https://github.com/Projanglez/TAB4DOS/releases/tag/v0.11.0
+[1.0.0]: https://github.com/Projanglez/TAB4DOS/releases/tag/v1.0.0
