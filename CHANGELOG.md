@@ -5,14 +5,14 @@ All notable changes to TAB4DOS are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project loosely adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.0.2] - 2026-07-10
+## [1.1.1] - 2026-07-10
 
 ### Fixed
 - Executables-first cycling (and its chirp) now applies only in command
   position (first word of the line). Arguments — e.g. after `TYPE` — cycle
   in plain alphabetical order again.
 
-## [1.0.1] - 2026-07-10
+## [1.1.0] - 2026-07-10
 
 ### Added
 - Completion now cycles executables (`.EXE`/`.COM`/`.BAT`) first, then the
@@ -112,6 +112,6 @@ and this project loosely adheres to [Semantic Versioning](https://semver.org/spe
 - Initial TSR with TAB filename completion for MS-DOS, hooking
   `INT 21h / AH=0Ah`.
 
-[1.0.2]: https://github.com/Projanglez/TAB4DOS/releases/tag/v1.0.2
-[1.0.1]: https://github.com/Projanglez/TAB4DOS/releases/tag/v1.0.1
+[1.1.1]: https://github.com/Projanglez/TAB4DOS/releases/tag/v1.1.1
+[1.1.0]: https://github.com/Projanglez/TAB4DOS/releases/tag/v1.1.0
 [1.0.0]: https://github.com/Projanglez/TAB4DOS/releases/tag/v1.0.0
