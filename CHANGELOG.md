@@ -5,6 +5,29 @@ All notable changes to TAB4DOS are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-07-10
+
+### Added
+- Completion now cycles executables (`.EXE`/`.COM`/`.BAT`) first, then the
+  remaining entries (directories count as non-executable), alphabetical
+  within each group. A short two-note chirp (PC speaker) marks the switch
+  from the executable to the non-executable group while cycling.
+
+### Fixed
+- TAB completion could miss files in directories with more than 64 entries:
+  the scan used a bare `*.*` pattern and capped the result cache at 64, so
+  files whose directory entry lay beyond position 64 were silently dropped.
+  The typed stem is now part of the FindFirst pattern (e.g. `DARK*.*`), so
+  DOS filters before the cache fills.
+- Command completion could miss PATH executables: the command index was
+  capped at 128 entries (DOS internals + a stocked `C:\DOS` already exhaust
+  it), so commands from later PATH directories were silently never indexed.
+  The cap is now 512 (the index lives on disk, so this costs no resident
+  memory), and the installer warns if it is ever reached.
+- The completion sort compared entries through a near pointer to a stack
+  buffer — undefined inside the hook, where SS != DS. The scratch entry now
+  lives in DGROUP (same bug class as the v0.3 DTA fix).
+
 ## [1.0.0] - 2026-06-26
 
 ### Added
@@ -82,4 +105,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Initial TSR with TAB filename completion for MS-DOS, hooking
   `INT 21h / AH=0Ah`.
 
+[1.0.1]: https://github.com/Projanglez/TAB4DOS/releases/tag/v1.0.1
 [1.0.0]: https://github.com/Projanglez/TAB4DOS/releases/tag/v1.0.0

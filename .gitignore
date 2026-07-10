@@ -8,3 +8,8 @@
 # Local Claude Code guidance / config (not published)
 CLAUDE.md
 .claude/
+
+# QEMU test VM: disk image and screenshots are local-only artifacts
+vm/hdd.img
+vm/shots/
+vm/__pycache__/

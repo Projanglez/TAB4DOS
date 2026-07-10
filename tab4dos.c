@@ -19,7 +19,7 @@
 #include <dos.h>
 #include <i86.h>
 
-#define TAB4DOS_VERSION "1.0.0"
+#define TAB4DOS_VERSION "1.0.1"
 
 extern unsigned _psp;
 
@@ -49,13 +49,24 @@ static int           file_count;
 /* DTA must be global (SS != DS in hook) */
 static unsigned char dta_buf[64];
 
+/* Sort scratch: must be global, NOT a local. A local lives on the caller's
+   stack (SS), but a near pointer passed to strcmp_ci/entry_before is
+   dereferenced via DS (SS != DS in the hook) and would read garbage. */
+static char          sort_name[NAME_LEN];
+static unsigned char sort_dir;
+
 /* -------- Command name cache (DOS internals + PATH executables) ---------- */
 /* Built once at install, written incrementally to a NAME_LEN-record file in
    %TEMP% and read on demand during completion (SmartDrive keeps it RAM-fast).
    Keeping it out of resident BSS saves CMD_MAX*NAME_LEN bytes; the file is
    built record-by-record with disk-based dedup, so no resident staging buffer
    is needed. */
-#define CMD_MAX 128
+/* Records live in the on-disk index file, so this cap costs no resident
+   memory — it only bounds the per-TAB linear read (512*13 = 6.5 KB, RAM-fast
+   under SmartDrive) and the O(n^2) install-time dedup. 128 was too small:
+   28 internals + a stocked C:\DOS already crowd out later PATH dirs, whose
+   commands then silently never complete. */
+#define CMD_MAX 512
 static int  cmd_count = 0;                 /* number of records in idx_path   */
 static char idx_path[80];                  /* full path to the index file     */
 static char cmd_name[NAME_LEN];            /* record read buffer / matched name */
@@ -71,9 +82,11 @@ static int  comp_cur       = -1;   /* index of currently shown match, -1=none */
 static int  shown_len      = 0;
 static int  comp_mode      = COMP_FILE;
 static int  comp_first_word = 0;
+static int  comp_last_group = -1;  /* 0=executable, 1=other, -1=no match shown */
 
 /* Path completion: directory prefix (global: SS != DS) */
-static char scan_pat[80];
+/* scan_pat must hold dir_prefix (<=66) + stem (<=12) + "*.*" + NUL = 82 */
+static char scan_pat[84];
 static char dir_prefix[68];
 static int  dir_prefix_len = 0;
 
@@ -137,6 +150,72 @@ void con_out( char c );
     modify [ah bx cx dx si di es];
 
 static void msg( char *s ) { while ( *s ) con_out( *s++ ); }
+
+/* -------- PC speaker chirp (direct port I/O, hook-safe) ------------------ */
+/* Marks the cycle transition from executable to non-executable matches.
+   Pure IN/OUT — no DOS or BIOS call, so it is safe inside the 0Ah hook. */
+
+/* Program PIT channel 2 with `divisor` and gate the speaker on. Calling it
+   again while the speaker is on just changes the pitch (no click/gap). */
+void spk_on( unsigned divisor );
+#pragma aux spk_on =        \
+    "mov bx,ax"             \
+    "mov al,0xB6"           \
+    "out 0x43,al"           \
+    "mov al,bl"             \
+    "out 0x42,al"           \
+    "mov al,bh"             \
+    "out 0x42,al"           \
+    "in  al,0x61"           \
+    "or  al,3"              \
+    "out 0x61,al"           \
+    parm   [ax]             \
+    modify [ax bx];
+
+void spk_off( void );
+#pragma aux spk_off =       \
+    "in  al,0x61"           \
+    "and al,0xFC"           \
+    "out 0x61,al"           \
+    modify [ax];
+
+/* Wait `n` toggles of the DRAM refresh bit (port 61h bit 4, ~15 us per
+   toggle on AT-class hardware => ~66 toggles per ms). CPU-speed independent
+   and interrupt-free. DX bounds each toggle wait so a stuck bit can only
+   shorten the tone, never hang the machine. */
+void io_delay( unsigned n );
+#pragma aux io_delay =      \
+    "xor bl,bl"             \
+    "mov dx,0xFFFF"         \
+    "w_poll:"               \
+    "in  al,0x61"           \
+    "and al,0x10"           \
+    "cmp al,bl"             \
+    "jne w_tog"             \
+    "dec dx"                \
+    "jnz w_poll"            \
+    "jmp w_done"            \
+    "w_tog:"                \
+    "mov bl,al"             \
+    "mov dx,0xFFFF"         \
+    "dec cx"                \
+    "jnz w_poll"            \
+    "w_done:"               \
+    parm   [cx]             \
+    modify [ax bx cx dx];
+
+/* Short two-note rising chirp (~988 Hz 30 ms -> ~1319 Hz 45 ms). The loop
+   keeps io_delay expanded only once (it is an inline #pragma aux body). */
+static void chirp( void )
+{
+    static const unsigned notes[2][2] = { { 1208, 1980 }, { 905, 2970 } };
+    int i;
+    for ( i = 0; i < 2; i++ ) {
+        spk_on( notes[i][0] );
+        io_delay( notes[i][1] );
+    }
+    spk_off();
+}
 
 /* -------- Key read via INT 16h/00h (direct opcode, no int86) ------------ */
 /* Full volatile modify list (CLAUDE.md #6): KEYB and other TSRs hook INT 16h
@@ -345,6 +424,31 @@ void dos_exit( void );
     aborts;
 
 /* -------- Directory scan ------------------------------------------------- */
+
+/* Executable = plain file ending in .EXE/.COM/.BAT (cache names are stored
+   lowercase). Directories count as non-executable. */
+static int entry_is_exec_name( const char *n, unsigned char is_dir )
+{
+    int l;
+    if ( is_dir ) return 0;
+    l = strlen_local( n );
+    if ( l < 5 || n[l-4] != '.' ) return 0;
+    return memcmp_local( n+l-3, "exe", 3 ) == 0 ||
+           memcmp_local( n+l-3, "com", 3 ) == 0 ||
+           memcmp_local( n+l-3, "bat", 3 ) == 0;
+}
+
+/* Cycle order: executables before non-executables, alphabetical within each
+   group. Returns nonzero if entry (a,ad) sorts before entry (b,bd). */
+static int entry_before( const char *a, unsigned char ad,
+                         const char *b, unsigned char bd )
+{
+    int ga = entry_is_exec_name( a, ad ) ? 0 : 1;
+    int gb = entry_is_exec_name( b, bd ) ? 0 : 1;
+    if ( ga != gb ) return ga < gb;
+    return strcmp_ci( a, b ) < 0;
+}
+
 static void scan_directory_path( void far *pat )
 {
     void far *save_dta;
@@ -367,28 +471,26 @@ static void scan_directory_path( void far *pat )
         }
         ok = dos_findnext();
     }
-    /* Sort results alphabetically (insertion sort, max 64 entries) */
+    /* Sort results: executables first, then the rest, alphabetical within
+       each group (insertion sort, max 64 entries). Scratch entry lives in
+       the global sort_name/sort_dir (SS != DS, see declaration). */
     {
-        int a, j, b; char tmp_name[NAME_LEN]; unsigned char tmp_dir;
+        int a, j, b;
         for ( a = 1; a < file_count; a++ ) {
-            for ( b = 0; b < NAME_LEN; b++ ) tmp_name[b] = file_cache[a][b];
-            tmp_dir = file_is_dir[a];
+            for ( b = 0; b < NAME_LEN; b++ ) sort_name[b] = file_cache[a][b];
+            sort_dir = file_is_dir[a];
             j = a - 1;
-            while ( j >= 0 && strcmp_ci( file_cache[j], tmp_name ) > 0 ) {
+            while ( j >= 0 && entry_before( sort_name, sort_dir,
+                                            file_cache[j], file_is_dir[j] ) ) {
                 for ( b = 0; b < NAME_LEN; b++ ) file_cache[j+1][b] = file_cache[j][b];
                 file_is_dir[j+1] = file_is_dir[j];
                 j--;
             }
-            for ( b = 0; b < NAME_LEN; b++ ) file_cache[j+1][b] = tmp_name[b];
-            file_is_dir[j+1] = tmp_dir;
+            for ( b = 0; b < NAME_LEN; b++ ) file_cache[j+1][b] = sort_name[b];
+            file_is_dir[j+1] = sort_dir;
         }
     }
     dos_set_dta( save_dta );
-}
-
-static void scan_directory( void )
-{
-    scan_directory_path( (void far *)"*.*" );
 }
 
 /* -------- History helpers ------------------------------------------------ */
@@ -623,21 +725,29 @@ static int do_complete( unsigned bseg, unsigned boff, int len, int dir )
         for ( j = 0; j < comp_base_len; j++ )
             comp_base[j] = buf[2+slash_pos+j];
 
-        /* Scan directory on first TAB: explicit prefix or current directory */
-        if ( dir_prefix_len > 0 ) {
-            for ( j = 0; j < dir_prefix_len; j++ ) scan_pat[j] = dir_prefix[j];
-            scan_pat[dir_prefix_len  ] = '*';
-            scan_pat[dir_prefix_len+1] = '.';
-            scan_pat[dir_prefix_len+2] = '*';
-            scan_pat[dir_prefix_len+3] = 0;
+        /* Scan directory on first TAB. The typed stem goes INTO the FindFirst
+           pattern ("DARK*.*", not "*.*"): DOS filters before our 64-entry
+           cache fills, so a match is found even in directories with more than
+           MAX_FILES entries (a bare "*.*" scan capped at 64 silently dropped
+           later entries). "*.*" is appended only if the stem has no dot yet
+           (FCB matching: "DARK*" alone would not match "DARKLAND.EXE"). */
+        {
+            int sp = 0, has_dot = 0;
+            for ( j = 0; j < dir_prefix_len; j++ ) scan_pat[sp++] = dir_prefix[j];
+            for ( j = 0; j < comp_base_len; j++ ) {
+                if ( comp_base[j] == '.' ) has_dot = 1;
+                scan_pat[sp++] = comp_base[j];
+            }
+            scan_pat[sp++] = '*';
+            if ( !has_dot ) { scan_pat[sp++] = '.'; scan_pat[sp++] = '*'; }
+            scan_pat[sp] = 0;
             scan_directory_path( (void far *)scan_pat );
-        } else {
-            scan_directory();
         }
 
         comp_mode       = COMP_FILE;   /* always try files first */
         comp_first_word = first_word;  /* remember for cmd fallback */
         comp_cur   = -1;               /* nothing shown yet */
+        comp_last_group = -1;
         shown_len  = dir_prefix_len + comp_base_len;
     }
 
@@ -706,6 +816,17 @@ static int do_complete( unsigned bseg, unsigned boff, int len, int dir )
     shown_len   = dir_prefix_len + addlen;
     comp_active = 1;
     comp_cur    = target;
+
+    /* Audible cue when cycling crosses from the executable group into the
+       non-executable group (matches are sorted executables-first). */
+    if ( comp_mode == COMP_FILE ) {
+        int g = entry_is_exec_name( file_cache[matched],
+                                    file_is_dir[matched] ) ? 0 : 1;
+        if ( comp_last_group == 0 && g == 1 ) chirp();
+        comp_last_group = g;
+    } else {
+        comp_last_group = -1;
+    }
 
     return len;
 }
@@ -1278,6 +1399,11 @@ int main( void )
         load_dos_cmds();    /* write DOS internals as records */
         scan_path_env();    /* append PATH executables (deduped) */
         dos_close( idx_h );
+        /* The scan stops silently once the index is full; warn so missing
+           completions are explainable instead of looking like a bug. */
+        if ( cmd_count >= CMD_MAX && !silent )
+            msg( "Warning: command index full; "
+                 "some PATH commands will not complete.\r\n" );
     }
 
     /* Create an empty history file; disable history if it cannot be created. */
