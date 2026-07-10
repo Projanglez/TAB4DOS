@@ -19,7 +19,7 @@
 #include <dos.h>
 #include <i86.h>
 
-#define TAB4DOS_VERSION "1.0.1"
+#define TAB4DOS_VERSION "1.0.2"
 
 extern unsigned _psp;
 
@@ -438,14 +438,19 @@ static int entry_is_exec_name( const char *n, unsigned char is_dir )
            memcmp_local( n+l-3, "bat", 3 ) == 0;
 }
 
-/* Cycle order: executables before non-executables, alphabetical within each
-   group. Returns nonzero if entry (a,ad) sorts before entry (b,bd). */
+/* Cycle order: in command position (first word of the line, i.e. the name
+   that will be executed) executables before non-executables, alphabetical
+   within each group. In argument position (e.g. after TYPE) plain
+   alphabetical — grouping would be wrong there. Returns nonzero if entry
+   (a,ad) sorts before entry (b,bd). */
 static int entry_before( const char *a, unsigned char ad,
                          const char *b, unsigned char bd )
 {
-    int ga = entry_is_exec_name( a, ad ) ? 0 : 1;
-    int gb = entry_is_exec_name( b, bd ) ? 0 : 1;
-    if ( ga != gb ) return ga < gb;
+    if ( comp_first_word ) {
+        int ga = entry_is_exec_name( a, ad ) ? 0 : 1;
+        int gb = entry_is_exec_name( b, bd ) ? 0 : 1;
+        if ( ga != gb ) return ga < gb;
+    }
     return strcmp_ci( a, b ) < 0;
 }
 
@@ -471,9 +476,9 @@ static void scan_directory_path( void far *pat )
         }
         ok = dos_findnext();
     }
-    /* Sort results: executables first, then the rest, alphabetical within
-       each group (insertion sort, max 64 entries). Scratch entry lives in
-       the global sort_name/sort_dir (SS != DS, see declaration). */
+    /* Sort results in entry_before order (position-dependent, see there;
+       insertion sort, max 64 entries). Scratch entry lives in the global
+       sort_name/sort_dir (SS != DS, see declaration). */
     {
         int a, j, b;
         for ( a = 1; a < file_count; a++ ) {
@@ -699,12 +704,13 @@ static int do_complete( unsigned bseg, unsigned boff, int len, int dir )
 
     if ( !comp_active ) {
         int arg_start, slash_pos, j;
-        int first_word;
 
-        /* arg_start: position after last space before cursor */
+        /* arg_start: position after last space before cursor. Set the
+           command-position flag BEFORE the directory scan below: the sort
+           in scan_directory_path reads it (entry_before). */
         arg_start = len;
         while ( arg_start > 0 && buf[2+arg_start-1] != ' ' ) arg_start--;
-        first_word = ( arg_start == 0 );
+        comp_first_word = ( arg_start == 0 );
 
         /* slash_pos: position after last \ or / in current argument */
         slash_pos = arg_start;
@@ -744,8 +750,7 @@ static int do_complete( unsigned bseg, unsigned boff, int len, int dir )
             scan_directory_path( (void far *)scan_pat );
         }
 
-        comp_mode       = COMP_FILE;   /* always try files first */
-        comp_first_word = first_word;  /* remember for cmd fallback */
+        comp_mode  = COMP_FILE;        /* always try files first */
         comp_cur   = -1;               /* nothing shown yet */
         comp_last_group = -1;
         shown_len  = dir_prefix_len + comp_base_len;
@@ -818,8 +823,9 @@ static int do_complete( unsigned bseg, unsigned boff, int len, int dir )
     comp_cur    = target;
 
     /* Audible cue when cycling crosses from the executable group into the
-       non-executable group (matches are sorted executables-first). */
-    if ( comp_mode == COMP_FILE ) {
+       non-executable group. Only in command position — in argument position
+       the matches are sorted plain alphabetical (no groups, no cue). */
+    if ( comp_mode == COMP_FILE && comp_first_word ) {
         int g = entry_is_exec_name( file_cache[matched],
                                     file_is_dir[matched] ) ? 0 : 1;
         if ( comp_last_group == 0 && g == 1 ) chirp();
