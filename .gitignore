@@ -9,7 +9,5 @@
 CLAUDE.md
 .claude/
 
-# QEMU test VM: disk image and screenshots are local-only artifacts
-vm/hdd.img
-vm/shots/
-vm/__pycache__/
+# QEMU test VM: local-only tooling, not published
+vm/
